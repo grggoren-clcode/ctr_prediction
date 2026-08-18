@@ -87,6 +87,19 @@ fraction of the sample), `--data-path` (override the raw data location).
   matches the Facebook paper's actual design (leaves *augment* the base
   features rather than replacing them), unlike the leaf-only
   `gbdt_leaves_ohe`. Also intended for `--model logreg`.
+- **`--feature-set freq_agg_leaves_concat`**: concatenates `freq_agg`'s
+  engineered features (capped context one-hot + smoothed target-encoded
+  user/ad aggregates + hour) with GBDT-leaf one-hot features from the same
+  GBDT `gbdt_leaves_ohe` already trains — on raw uncapped one-hot, **not**
+  on freq_agg's own `_ctr`/`_count` columns
+  (`feature_engineering.build_freq_agg_leaves_concat_pipeline`). This is
+  deliberate: `_ctr` is leave-one-out encoded for train_df (each row's own
+  label excluded from its own category's stats — see `add_freq_agg_features`),
+  which introduces a small train-only artifact that a linear model barely
+  notices but a second GBDT can and empirically does exploit — a GBDT trained
+  directly on freq_agg's dense matrix scored AUC ~0.48 (worse than random) on
+  held-out val, because its leaf splits encoded that train-only artifact
+  rather than transferable signal. Also intended for `--model logreg`.
 
 ## Exploration
 

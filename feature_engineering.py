@@ -132,6 +132,43 @@ def build_gbdt_leaves_concat_pipeline(cat_cols: list[str], gbdt_params: dict | N
     )
 
 
+def build_freq_agg_leaves_concat_pipeline(
+    freq_cat_cols: list[str],
+    freq_num_cols: list[str],
+    gbdt_cat_cols: list[str],
+    gbdt_params: dict | None = None,
+) -> FeatureUnion:
+    """`freq_agg_leaves_concat` feature set: concatenates `freq_agg`'s
+    engineered features (capped context one-hot + smoothed target-encoded
+    user/ad aggregates + hour) with GBDT-leaf one-hot features from a GBDT
+    trained on raw uncapped one-hot vectors (`gbdt_cat_cols`, same as
+    `gbdt_leaves_ohe`) — deliberately NOT trained on freq_agg's own
+    `_ctr`/`_count` columns.
+
+    Why not train the internal GBDT on freq_agg's own features: `_ctr` is
+    computed via **leave-one-out** for train_df (each row's own label is
+    subtracted before computing its smoothed CTR — see
+    `add_freq_agg_features`), which introduces a small systematic train-only
+    artifact: a clicked row's own `_ctr` value is nudged slightly *lower*
+    than an otherwise-identical unclicked row's, purely because its own click
+    was excluded from the numerator. A linear model barely notices this
+    (swamped by the real cross-category signal); a second GBDT can and
+    empirically does exploit it — confirmed directly: a GBDT trained on
+    freq_agg's dense matrix scored AUC ~0.48 (worse than random) on held-out
+    val, because the leaf splits it learned encode a train-only LOO artifact
+    that doesn't exist in val, so they transfer as noise. Training the leaf
+    GBDT on plain one-hot instead avoids this entirely, since raw category
+    indicators carry no target-derived/self-referential information — this
+    is exactly the same GBDT `gbdt_leaves_ohe` already trains and validates.
+    """
+    return FeatureUnion(
+        [
+            ("raw_freq_agg", build_preprocessing_pipeline(freq_cat_cols, freq_num_cols)),
+            ("gbdt_leaves", build_gbdt_leaves_ohe_pipeline(gbdt_cat_cols, gbdt_params=gbdt_params)),
+        ]
+    )
+
+
 def add_hour_features(df: pd.DataFrame, hour_col: str = HOUR_COL) -> pd.DataFrame:
     """Parse Avazu's YYMMDDHH `hour` column into `hour_of_day` and `day_of_week`."""
     df = df.copy()

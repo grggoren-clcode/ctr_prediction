@@ -28,6 +28,7 @@ from feature_engineering import (
     GBDTLeafEncoder,
     add_freq_agg_features,
     add_hour_features,
+    build_freq_agg_leaves_concat_pipeline,
     build_gbdt_leaves_concat_pipeline,
     build_gbdt_leaves_ohe_pipeline,
     build_ohe_only_pipeline,
@@ -115,16 +116,17 @@ def build_gbdt_leaf_features(train_df, val_df):
 
 
 # Which --model choices each --feature-set can pair with. baseline_ohe/
-# gbdt_leaves/gbdt_leaves_ohe/gbdt_leaves_concat all produce sparse output;
-# HistGradientBoostingClassifier requires dense X and raises a TypeError on
-# sparse input, so hist_gbdt is excluded from all four. logreg and lightgbm
-# both accept sparse input natively.
+# gbdt_leaves/gbdt_leaves_ohe/gbdt_leaves_concat/freq_agg_leaves_concat all
+# produce sparse output; HistGradientBoostingClassifier requires dense X and
+# raises a TypeError on sparse input, so hist_gbdt is excluded from all five.
+# logreg and lightgbm both accept sparse input natively.
 FEATURE_SET_COMPATIBLE_MODELS = {
     "freq_agg": {"logreg", "hist_gbdt", "lightgbm"},
     "baseline_ohe": {"logreg", "lightgbm"},
     "gbdt_leaves": {"logreg", "lightgbm"},
     "gbdt_leaves_ohe": {"logreg", "lightgbm"},
     "gbdt_leaves_concat": {"logreg", "lightgbm"},
+    "freq_agg_leaves_concat": {"logreg", "lightgbm"},
 }
 
 
@@ -149,6 +151,8 @@ def feature_set_engineering_key(feature_set: str) -> str:
     """
     if feature_set in ("baseline_ohe", "gbdt_leaves_ohe", "gbdt_leaves_concat"):
         return "baseline_ohe_family"
+    if feature_set in ("freq_agg", "freq_agg_leaves_concat"):
+        return "freq_agg_family"
     return feature_set
 
 
@@ -161,9 +165,37 @@ def engineer_features(feature_set: str, train_df, val_df):
     on the same feature_set (e.g. run_pipeline.py) can engineer features once
     and build a fresh preprocessor per model.
     """
-    if feature_set == "freq_agg":
-        train_df, val_df, cat_cols, num_cols, feature_cols, fit_stats, global_ctr = build_features(train_df, val_df)
-        state = {"cat_cols": cat_cols, "num_cols": num_cols, "fit_stats": fit_stats, "global_ctr": global_ctr}
+    if feature_set in ("freq_agg", "freq_agg_leaves_concat"):
+        train_df, val_df, freq_cat_cols, freq_num_cols, freq_feature_cols, fit_stats, global_ctr = build_features(
+            train_df, val_df
+        )
+        # Always compute the wider (freq_agg_leaves_concat-sized) feature_cols
+        # and state here, regardless of which of the two feature_sets was
+        # actually requested — build_features only ADDS the _ctr/_count
+        # columns, never drops the original raw categorical columns, so the
+        # raw baseline_ohe-style columns (needed only by
+        # freq_agg_leaves_concat's GBDT branch, which trains on plain one-hot
+        # rather than freq_agg's own LOO-adjusted features; see
+        # feature_engineering.build_freq_agg_leaves_concat_pipeline) are
+        # already present in train_df/val_df alongside freq_agg's engineered
+        # ones, and a downstream ColumnTransformer/Pipeline simply ignores
+        # any columns it doesn't select by name — so plain "freq_agg" is
+        # unaffected by the extra columns/state entries. This makes both
+        # feature_sets' engineer_features output byte-identical, which is
+        # what lets feature_set_engineering_key group them and avoid running
+        # this (expensive, groupby-heavy) build_features call twice when both
+        # appear in the same run (e.g. run_pipeline.py's RUNS).
+        gbdt_cat_cols = ALL_CAT_FEATURE_COLS + HOUR_DERIVED_COLS
+        feature_cols = list(dict.fromkeys(freq_feature_cols + gbdt_cat_cols))
+        state = {
+            "cat_cols": freq_cat_cols,
+            "num_cols": freq_num_cols,
+            "freq_cat_cols": freq_cat_cols,
+            "freq_num_cols": freq_num_cols,
+            "gbdt_cat_cols": gbdt_cat_cols,
+            "fit_stats": fit_stats,
+            "global_ctr": global_ctr,
+        }
     elif feature_set == "baseline_ohe":
         train_df, val_df, cat_cols, feature_cols = build_baseline_ohe_features(train_df, val_df)
         state = {"cat_cols": cat_cols}
@@ -199,6 +231,13 @@ def build_preprocessor(feature_set: str, state: dict, seed: int):
         return build_gbdt_leaves_concat_pipeline(
             state["cat_cols"], gbdt_params={**GBDT_LEAF_ENCODER_PARAMS, "random_state": seed}
         )
+    if feature_set == "freq_agg_leaves_concat":
+        return build_freq_agg_leaves_concat_pipeline(
+            state["freq_cat_cols"],
+            state["freq_num_cols"],
+            state["gbdt_cat_cols"],
+            gbdt_params={**GBDT_LEAF_ENCODER_PARAMS, "random_state": seed},
+        )
     raise ValueError(f"Unknown feature_set: {feature_set!r}")
 
 
@@ -210,7 +249,14 @@ def main():
     parser.add_argument(
         "--feature-set",
         default="freq_agg",
-        choices=["freq_agg", "baseline_ohe", "gbdt_leaves", "gbdt_leaves_ohe", "gbdt_leaves_concat"],
+        choices=[
+            "freq_agg",
+            "baseline_ohe",
+            "gbdt_leaves",
+            "gbdt_leaves_ohe",
+            "gbdt_leaves_concat",
+            "freq_agg_leaves_concat",
+        ],
     )
     parser.add_argument("--val-frac", type=float, default=VAL_FRAC)
     parser.add_argument("--output-dir", type=Path, default=OUTPUTS_DIR)
@@ -237,8 +283,7 @@ def main():
     print_metrics(metrics)
 
     # freq_agg's filenames stay unsuffixed (backward compatible with existing
-    # results/); every other feature_set (baseline_ohe, gbdt_leaves,
-    # gbdt_leaves_ohe) gets a disambiguating suffix.
+    # results/); every other feature_set gets a disambiguating suffix.
     stem = args.model if args.feature_set == "freq_agg" else f"{args.model}_{args.feature_set}"
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -248,10 +293,11 @@ def main():
     # Bundle the pipeline with the fitted aggregate stats it depends on, so a
     # loaded artifact can score fresh raw data without needing the original
     # train_df around (see feature_engineering.apply_freq_agg_stats). Only
-    # freq_agg has such aggregate fit-state — the other feature sets' fitted
-    # pipeline steps (OneHotEncoder/GBDTLeafEncoder) are their own fit-state.
+    # freq_agg/freq_agg_leaves_concat have such aggregate fit-state — the
+    # other feature sets' fitted pipeline steps (OneHotEncoder/GBDTLeafEncoder)
+    # are their own fit-state.
     artifact = {"pipeline": pipeline, "feature_set": args.feature_set}
-    if args.feature_set == "freq_agg":
+    if args.feature_set in ("freq_agg", "freq_agg_leaves_concat"):
         artifact.update({"fit_stats": state["fit_stats"], "global_ctr": state["global_ctr"], "group_cols": GROUP_COLS})
     save_model(artifact, MODELS_DIR / f"{stem}.joblib")
     return metrics

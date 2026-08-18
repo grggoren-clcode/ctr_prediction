@@ -2,9 +2,9 @@
 
 Trains `logreg`/`hist_gbdt` on the `freq_agg` feature set, `logreg` on the
 naive `baseline_ohe` feature set, and `logreg` on the GBDT-leaf-embedding
-`gbdt_leaves`/`gbdt_leaves_ohe`/`gbdt_leaves_concat` feature sets (see
-trainer.py), all on the same sample/split, and prints a comparison table.
-This is the scaffold's smoke test against the real data.
+`gbdt_leaves`/`gbdt_leaves_ohe`/`gbdt_leaves_concat`/`freq_agg_leaves_concat`
+feature sets (see trainer.py), all on the same sample/split, and prints a
+comparison table. This is the scaffold's smoke test against the real data.
 """
 
 import argparse
@@ -25,10 +25,10 @@ from trainer import (
 )
 
 # (model_name, feature_set) pairs to compare. hist_gbdt is deliberately not
-# paired with baseline_ohe/gbdt_leaves/gbdt_leaves_ohe/gbdt_leaves_concat: it
-# needs dense input, and densifying an uncapped, high-cardinality one-hot
-# matrix would be infeasible (enforced by
-# trainer.check_feature_set_model_compatible below).
+# paired with the sparse-output feature sets (baseline_ohe/gbdt_leaves/
+# gbdt_leaves_ohe/gbdt_leaves_concat/freq_agg_leaves_concat): it needs dense
+# input, and densifying an uncapped, high-cardinality one-hot matrix would be
+# infeasible (enforced by trainer.check_feature_set_model_compatible below).
 RUNS = [
     ("logreg", "freq_agg"),
     ("hist_gbdt", "freq_agg"),
@@ -36,6 +36,7 @@ RUNS = [
     ("logreg", "gbdt_leaves"),
     ("logreg", "gbdt_leaves_ohe"),
     ("logreg", "gbdt_leaves_concat"),
+    ("logreg", "freq_agg_leaves_concat"),
 ]
 
 
