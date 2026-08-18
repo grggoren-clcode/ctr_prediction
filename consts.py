@@ -38,8 +38,24 @@ ALL_CAT_FEATURE_COLS = CONTEXT_FEATURE_COLS + USER_FEATURE_COLS + AD_FEATURE_COL
 HOUR_DERIVED_COLS = ["hour_of_day", "day_of_week"]
 
 # Defaults for the internal GBDT that feature_engineering.GBDTLeafEncoder fits
-# to derive leaf-index features (the `gbdt_leaves`/`gbdt_leaves_ohe` feature
-# sets). random_state is deliberately excluded here — trainer.py merges in
-# args.seed at construction time, same as it does for get_model's
-# random_state kwarg.
-GBDT_LEAF_ENCODER_PARAMS = {"n_estimators": 500, "num_leaves": 64}
+# to derive leaf-index features (the `gbdt_leaves`/`gbdt_leaves_ohe`/
+# `gbdt_leaves_concat` feature sets). random_state is deliberately excluded
+# here — trainer.py merges in args.seed at construction time, same as it does
+# for get_model's random_state kwarg.
+#
+# Shrunk back to 100 trees/31 leaves (from a 500/64 setting that empirically
+# overfit under this project's time-based split — see gbdt_leaves' AUC
+# regressing from 0.7385 to 0.7096 on the full 2M-row sample when pushed to
+# 500/64) plus explicit anti-overfitting regularization: min_child_samples
+# raises the minimum leaf size well above lightgbm's default (20), and
+# feature_fraction/bagging_fraction+bagging_freq decorrelate trees by
+# subsampling columns/rows per tree, so no single tree can lean too heavily
+# on a memorization-prone near-unique column (device_id/device_ip).
+GBDT_LEAF_ENCODER_PARAMS = {
+    "n_estimators": 100,
+    "num_leaves": 31,
+    "min_child_samples": 100,
+    "feature_fraction": 0.5,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 1,
+}

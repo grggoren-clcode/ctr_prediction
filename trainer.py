@@ -28,6 +28,7 @@ from feature_engineering import (
     GBDTLeafEncoder,
     add_freq_agg_features,
     add_hour_features,
+    build_gbdt_leaves_concat_pipeline,
     build_gbdt_leaves_ohe_pipeline,
     build_ohe_only_pipeline,
     build_preprocessing_pipeline,
@@ -114,14 +115,16 @@ def build_gbdt_leaf_features(train_df, val_df):
 
 
 # Which --model choices each --feature-set can pair with. baseline_ohe/
-# gbdt_leaves/gbdt_leaves_ohe all produce sparse output; HistGradientBoostingClassifier
-# requires dense X and raises a TypeError on sparse input, so hist_gbdt is
-# excluded from all three. logreg and lightgbm both accept sparse input natively.
+# gbdt_leaves/gbdt_leaves_ohe/gbdt_leaves_concat all produce sparse output;
+# HistGradientBoostingClassifier requires dense X and raises a TypeError on
+# sparse input, so hist_gbdt is excluded from all four. logreg and lightgbm
+# both accept sparse input natively.
 FEATURE_SET_COMPATIBLE_MODELS = {
     "freq_agg": {"logreg", "hist_gbdt", "lightgbm"},
     "baseline_ohe": {"logreg", "lightgbm"},
     "gbdt_leaves": {"logreg", "lightgbm"},
     "gbdt_leaves_ohe": {"logreg", "lightgbm"},
+    "gbdt_leaves_concat": {"logreg", "lightgbm"},
 }
 
 
@@ -132,6 +135,21 @@ def check_feature_set_model_compatible(feature_set: str, model_name: str) -> Non
             f"--model {model_name!r} is not compatible with --feature-set {feature_set!r} "
             f"(needs dense input; compatible models: {sorted(compatible)})"
         )
+
+
+def feature_set_engineering_key(feature_set: str) -> str:
+    """Groups feature_sets that produce identical `engineer_features` output
+    for the same (train_df, val_df) — i.e. they resolve to the same
+    underlying `build_*_features` call. baseline_ohe/gbdt_leaves_ohe/
+    gbdt_leaves_concat all call `build_baseline_ohe_features` with identical
+    arguments (see `engineer_features` below), so they share a key. Callers
+    that engineer features for multiple feature_sets (e.g. run_pipeline.py)
+    can cache by this key instead of by feature_set to avoid redundant work.
+    Co-located with `engineer_features` so the two can't drift out of sync.
+    """
+    if feature_set in ("baseline_ohe", "gbdt_leaves_ohe", "gbdt_leaves_concat"):
+        return "baseline_ohe_family"
+    return feature_set
 
 
 def engineer_features(feature_set: str, train_df, val_df):
@@ -152,7 +170,7 @@ def engineer_features(feature_set: str, train_df, val_df):
     elif feature_set == "gbdt_leaves":
         train_df, val_df, feature_cols = build_gbdt_leaf_features(train_df, val_df)
         state = {}
-    elif feature_set == "gbdt_leaves_ohe":
+    elif feature_set in ("gbdt_leaves_ohe", "gbdt_leaves_concat"):
         train_df, val_df, cat_cols, feature_cols = build_baseline_ohe_features(train_df, val_df)
         state = {"cat_cols": cat_cols}
     else:
@@ -177,6 +195,10 @@ def build_preprocessor(feature_set: str, state: dict, seed: int):
         return build_gbdt_leaves_ohe_pipeline(
             state["cat_cols"], gbdt_params={**GBDT_LEAF_ENCODER_PARAMS, "random_state": seed}
         )
+    if feature_set == "gbdt_leaves_concat":
+        return build_gbdt_leaves_concat_pipeline(
+            state["cat_cols"], gbdt_params={**GBDT_LEAF_ENCODER_PARAMS, "random_state": seed}
+        )
     raise ValueError(f"Unknown feature_set: {feature_set!r}")
 
 
@@ -188,7 +210,7 @@ def main():
     parser.add_argument(
         "--feature-set",
         default="freq_agg",
-        choices=["freq_agg", "baseline_ohe", "gbdt_leaves", "gbdt_leaves_ohe"],
+        choices=["freq_agg", "baseline_ohe", "gbdt_leaves", "gbdt_leaves_ohe", "gbdt_leaves_concat"],
     )
     parser.add_argument("--val-frac", type=float, default=VAL_FRAC)
     parser.add_argument("--output-dir", type=Path, default=OUTPUTS_DIR)

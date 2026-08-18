@@ -2,9 +2,9 @@
 
 Trains `logreg`/`hist_gbdt` on the `freq_agg` feature set, `logreg` on the
 naive `baseline_ohe` feature set, and `logreg` on the GBDT-leaf-embedding
-`gbdt_leaves`/`gbdt_leaves_ohe` feature sets (see trainer.py), all on the same
-sample/split, and prints a comparison table. This is the scaffold's smoke
-test against the real data.
+`gbdt_leaves`/`gbdt_leaves_ohe`/`gbdt_leaves_concat` feature sets (see
+trainer.py), all on the same sample/split, and prints a comparison table.
+This is the scaffold's smoke test against the real data.
 """
 
 import argparse
@@ -15,18 +15,27 @@ from sklearn.pipeline import Pipeline
 from consts import LABEL_COL, RANDOM_SEED, RAW_DATA_PATH, SAMPLE_N_ROWS, VAL_FRAC
 from data_loader import load_sample, time_based_split, validate_schema
 from evaluator import evaluate
-from trainer import build_preprocessor, check_feature_set_model_compatible, engineer_features, get_model, train_model
+from trainer import (
+    build_preprocessor,
+    check_feature_set_model_compatible,
+    engineer_features,
+    feature_set_engineering_key,
+    get_model,
+    train_model,
+)
 
 # (model_name, feature_set) pairs to compare. hist_gbdt is deliberately not
-# paired with baseline_ohe/gbdt_leaves/gbdt_leaves_ohe: it needs dense input,
-# and densifying an uncapped, high-cardinality one-hot matrix would be
-# infeasible (enforced by trainer.check_feature_set_model_compatible below).
+# paired with baseline_ohe/gbdt_leaves/gbdt_leaves_ohe/gbdt_leaves_concat: it
+# needs dense input, and densifying an uncapped, high-cardinality one-hot
+# matrix would be infeasible (enforced by
+# trainer.check_feature_set_model_compatible below).
 RUNS = [
     ("logreg", "freq_agg"),
     ("hist_gbdt", "freq_agg"),
     ("logreg", "baseline_ohe"),
     ("logreg", "gbdt_leaves"),
     ("logreg", "gbdt_leaves_ohe"),
+    ("logreg", "gbdt_leaves_concat"),
 ]
 
 
@@ -49,16 +58,21 @@ def main():
 
     # Feature engineering (the expensive part) depends only on feature_set,
     # not model_name, so each distinct feature_set's engineered DataFrames are
-    # built once and cached via trainer.engineer_features. A fresh preprocessor
-    # is then built per run via trainer.build_preprocessor, so each model gets
-    # its own unfitted transformer rather than reusing one already fitted by a
-    # prior run on the same feature_set.
-    engineered_by_set = {}
+    # built once and cached via trainer.engineer_features — keyed by
+    # trainer.feature_set_engineering_key rather than feature_set itself, since
+    # baseline_ohe/gbdt_leaves_ohe/gbdt_leaves_concat all resolve to the same
+    # underlying build_baseline_ohe_features call and would otherwise redo that
+    # work (add_hour_features' full-DataFrame parsing) once per feature_set. A
+    # fresh preprocessor is then built per run via trainer.build_preprocessor,
+    # so each model gets its own unfitted transformer rather than reusing one
+    # already fitted by a prior run on the same feature_set.
+    engineered_by_key = {}
 
     def get_engineered(feature_set):
-        if feature_set not in engineered_by_set:
-            engineered_by_set[feature_set] = engineer_features(feature_set, train_df, val_df)
-        return engineered_by_set[feature_set]
+        key = feature_set_engineering_key(feature_set)
+        if key not in engineered_by_key:
+            engineered_by_key[key] = engineer_features(feature_set, train_df, val_df)
+        return engineered_by_key[key]
 
     results = {}
     for model_name, feature_set in RUNS:

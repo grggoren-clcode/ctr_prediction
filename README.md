@@ -79,6 +79,14 @@ fraction of the sample), `--data-path` (override the raw data location).
   already a binary indicator, so there's no categorical `max_bin` cap to lose
   resolution to, at the cost of a much wider/sparser GBDT input. Also intended
   for `--model logreg`.
+- **`--feature-set gbdt_leaves_concat`**: concatenates the raw `baseline_ohe`
+  one-hot vectors with the `gbdt_leaves_ohe` leaf features
+  (`feature_engineering.build_gbdt_leaves_concat_pipeline`, via
+  `sklearn.pipeline.FeatureUnion`), so the linear model sees both the
+  original linear signal and the GBDT's induced non-linear signal — this
+  matches the Facebook paper's actual design (leaves *augment* the base
+  features rather than replacing them), unlike the leaf-only
+  `gbdt_leaves_ohe`. Also intended for `--model logreg`.
 
 ## Exploration
 

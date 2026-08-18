@@ -1,7 +1,7 @@
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from consts import HOUR_COL, LABEL_COL
@@ -107,6 +107,27 @@ def build_gbdt_leaves_ohe_pipeline(cat_cols: list[str], gbdt_params: dict | None
         [
             ("ohe", build_ohe_only_pipeline(cat_cols)),
             ("gbdt_leaves", GBDTLeafEncoder(gbdt_params=gbdt_params)),
+        ]
+    )
+
+
+def build_gbdt_leaves_concat_pipeline(cat_cols: list[str], gbdt_params: dict | None = None) -> FeatureUnion:
+    """`gbdt_leaves_concat` feature set: concatenates the raw uncapped
+    one-hot vectors (same as `baseline_ohe`) with the GBDT-leaf one-hot
+    features from `build_gbdt_leaves_ohe_pipeline`, so the downstream linear
+    model sees both the original linear signal AND the GBDT's induced
+    non-linear interaction/binning signal — matching the Facebook GBDT+LR
+    paper's actual design (leaves augment, not replace, the base features),
+    unlike the leaf-only `gbdt_leaves_ohe` variant. Note: the "raw_ohe" branch
+    and the OHE step inside "gbdt_leaves" each fit their own OneHotEncoder on
+    the same cat_cols independently (FeatureUnion doesn't share fitted state
+    across branches) — a small duplicated cost, cheap relative to the GBDT/LR
+    fits themselves.
+    """
+    return FeatureUnion(
+        [
+            ("raw_ohe", build_ohe_only_pipeline(cat_cols)),
+            ("gbdt_leaves", build_gbdt_leaves_ohe_pipeline(cat_cols, gbdt_params=gbdt_params)),
         ]
     )
 
