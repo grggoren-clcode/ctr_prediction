@@ -196,6 +196,12 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
     already-fit `w0_`/`w_`/`v_`, so this satisfies CLAUDE.md's no-leakage
     rule the same way the rest of this module's fit-on-train-only
     transformers do.
+
+    `n_epochs` is an upper bound, not a target — `fit` stops early once the
+    (training-loss) plateau-detection in `early_stopping_patience`/
+    `early_stopping_tol` triggers, so raising `n_epochs` to explore whether
+    more training helps is safe by default rather than risking silent
+    overfitting on an unattended run.
     """
 
     def __init__(
@@ -205,6 +211,8 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         batch_size: int = 4096,
         learning_rate: float = 0.05,
         l2_reg: float = 1e-5,
+        early_stopping_patience: int = 3,
+        early_stopping_tol: float = 1e-4,
         random_state: int | None = None,
     ):
         self.n_factors = n_factors
@@ -212,6 +220,8 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.l2_reg = l2_reg
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_tol = early_stopping_tol
         self.random_state = random_state
 
     def fit(self, X, y):
@@ -229,6 +239,8 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         self.v_ = rng.normal(scale=0.01, size=(d, self.n_factors))
 
         n_batches = max(1, math.ceil(n / self.batch_size))
+        best_loss = np.inf
+        epochs_without_improvement = 0
         for epoch in range(self.n_epochs):
             order = rng.permutation(n)
             epoch_losses = []
@@ -275,6 +287,25 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
             losses, sizes = zip(*epoch_losses, strict=True)
             weighted_loss = np.average(losses, weights=sizes)
             print(f"[FMEmbeddingEncoder] epoch {epoch + 1}/{self.n_epochs} mean logloss: {weighted_loss:.4f}")
+
+            # Plateau-based early stopping on training loss: guards against
+            # silently wasting compute (or, if a future n_epochs bump pushes
+            # well past convergence, overfitting) when nobody's watching the
+            # printed per-epoch loss. Judges "improvement" against the best
+            # loss seen so far (not just the previous epoch), since the loss
+            # can wobble slightly upward between epochs near convergence
+            # without that meaning training has actually plateaued.
+            if weighted_loss < best_loss - self.early_stopping_tol:
+                best_loss = weighted_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= self.early_stopping_patience:
+                    print(
+                        f"[FMEmbeddingEncoder] early stopping at epoch {epoch + 1}/{self.n_epochs} "
+                        f"(no improvement > {self.early_stopping_tol} for {self.early_stopping_patience} epochs)"
+                    )
+                    break
         return self
 
     def transform(self, X):

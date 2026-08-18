@@ -62,14 +62,30 @@ GBDT_LEAF_ENCODER_PARAMS = {
 
 # Defaults for feature_engineering.FMEmbeddingEncoder (the `freq_agg_fm_concat`
 # feature set's internal Factorization Machine). n_factors is the latent
-# embedding dimension — kept small (8) since these become concatenated input
-# features for the downstream LR, not the final prediction themselves.
+# embedding dimension — kept modest (16) since these become concatenated
+# input features for the downstream LR, not the final prediction themselves.
 # random_state is deliberately excluded — trainer.py merges in args.seed at
 # construction time, same as GBDT_LEAF_ENCODER_PARAMS above.
+#
+# Tuned up from an initial 8-factor/5-epoch/lr=0.05 pass, which undershot —
+# the printed per-epoch logloss was still dropping at epoch 5, meaning SGD
+# hadn't converged. A sweep on a 100K-row loaded sample (80K-row train split
+# after the usual 80/20 time-based split; measuring the FM's own raw
+# prediction, not yet the downstream concat+LR result) found learning_rate
+# and n_epochs to be the highest-leverage knobs: lr=0.15 with enough epochs
+# to let it settle roughly doubled the FM's own val AUC (0.67 -> 0.74), while
+# l2_reg and n_factors beyond ~16 gave comparatively little. n_epochs is set
+# lower here (30) than the ~120 that helped on that 80K-row train split,
+# since the full ~2M-row sample's ~1.6M-row train split gives roughly 20x
+# more gradient updates per epoch (1.6M / 80K) — confirmed at full scale: the
+# printed per-epoch loss had already flattened out well before epoch 30.
+# n_epochs is only an upper bound in any case — FMEmbeddingEncoder.fit now
+# stops early once its plateau-detection (early_stopping_patience/_tol)
+# triggers, so this doesn't need to be retuned precisely.
 FM_ENCODER_PARAMS = {
-    "n_factors": 8,
-    "n_epochs": 5,
+    "n_factors": 16,
+    "n_epochs": 30,
     "batch_size": 4096,
-    "learning_rate": 0.05,
+    "learning_rate": 0.15,
     "l2_reg": 1e-5,
 }
