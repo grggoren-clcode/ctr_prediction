@@ -38,19 +38,47 @@ python run_pipeline.py
 
 Loads the configured sample, does a **time-based split** (train on earlier hours,
 validate on later hours — this both simulates real deployment and avoids
-future-into-past leakage), engineers features, trains both `logreg` and `hist_gbdt`,
-and prints an AUC / LogLoss / PR-AUC comparison table.
+future-into-past leakage), engineers features, trains every `(model, feature_set)`
+pair in `run_pipeline.RUNS`, and prints an AUC / LogLoss / PR-AUC comparison table.
 
 To train and persist a single model:
 
 ```
-python trainer.py --model hist_gbdt --n-rows 500000
+python trainer.py --model hist_gbdt --feature-set freq_agg --n-rows 500000
 ```
 
-This saves metrics to `results/outputs/` and the fitted pipeline to `results/models/`.
+This saves metrics to `results/outputs/` and the fitted pipeline to `results/models/`
+(filenames are `{model}.joblib`/`metrics_{model}.json` for the default `freq_agg`
+feature set, `{model}_{feature_set}.joblib`/`metrics_{model}_{feature_set}.json`
+otherwise).
 
 Options for both scripts: `--n-rows` (sample size), `--val-frac` (validation
 fraction of the sample), `--data-path` (override the raw data location).
+`trainer.py` additionally takes `--model` and `--feature-set`:
+
+- **`--feature-set freq_agg`** (default): context columns one-hot (capped at 50
+  categories) + leakage-safe smoothed target-encoding for the high-cardinality
+  user/ad columns. Pairs with any `--model`.
+- **`--feature-set baseline_ohe`**: every raw categorical column (including
+  `device_id`/`device_ip`/`site_id`/`app_id`) one-hot encoded, uncapped, sparse —
+  a naive baseline with no target-encoding. Intended for `--model logreg` (sparse
+  input; `hist_gbdt` needs dense and this matrix is too wide to densify).
+- **`--feature-set gbdt_leaves`**: the Facebook GBDT+LR technique — a lightgbm
+  GBDT trains on the raw categorical + hour columns (via lightgbm's native
+  categorical handling), then each row is re-encoded as the one-hot
+  concatenation of which leaf it landed in per tree
+  (`feature_engineering.GBDTLeafEncoder`), and a linear model trains on those
+  induced features instead of the raw columns. Also intended for `--model logreg`.
+  Note: lightgbm's native categorical handling has a `max_bin` cap, so very
+  high-cardinality columns (`device_id`/`device_ip`) lose some resolution —
+  see `gbdt_leaves_ohe` below for a variant that avoids this.
+- **`--feature-set gbdt_leaves_ohe`**: same GBDT+LR leaf-embedding technique,
+  but the internal GBDT trains on the same uncapped one-hot vectors as
+  `baseline_ohe` instead of raw categorical columns
+  (`feature_engineering.build_gbdt_leaves_ohe_pipeline`) — every input is
+  already a binary indicator, so there's no categorical `max_bin` cap to lose
+  resolution to, at the cost of a much wider/sparser GBDT input. Also intended
+  for `--model logreg`.
 
 ## Exploration
 

@@ -26,3 +26,20 @@ AD_FEATURE_COLS = ["site_id", "site_domain", "site_category", "app_id", "app_dom
 # hour is handled separately (drives the split + derived hour_of_day/day_of_week), so it's
 # excluded here to avoid double-listing.
 CONTEXT_FEATURE_COLS = ["C1", "banner_pos", "C14", "C15", "C16", "C17", "C18", "C19", "C20", "C21"]
+
+# All raw categorical columns across the three feature groups above — used by
+# the `baseline_ohe` feature set (see trainer.build_baseline_ohe_features),
+# which one-hot encodes everything with no target-encoding/aggregation.
+ALL_CAT_FEATURE_COLS = CONTEXT_FEATURE_COLS + USER_FEATURE_COLS + AD_FEATURE_COLS
+
+# hour_of_day/day_of_week, as added by feature_engineering.add_hour_features.
+# Named as a constant since build_features (as numeric), build_baseline_ohe_features
+# (as categorical), and build_gbdt_leaf_features (as numeric) all reference them.
+HOUR_DERIVED_COLS = ["hour_of_day", "day_of_week"]
+
+# Defaults for the internal GBDT that feature_engineering.GBDTLeafEncoder fits
+# to derive leaf-index features (the `gbdt_leaves`/`gbdt_leaves_ohe` feature
+# sets). random_state is deliberately excluded here — trainer.py merges in
+# args.seed at construction time, same as it does for get_model's
+# random_state kwarg.
+GBDT_LEAF_ENCODER_PARAMS = {"n_estimators": 500, "num_leaves": 64}

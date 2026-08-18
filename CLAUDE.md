@@ -2,6 +2,13 @@
 
 CTR (click-through rate) prediction research project. See `README.md` (once created) for setup and usage.
 
+## Project locations
+
+- Project dir: `/Users/gregorygoren/PycharmProjects/ctr_prediction`
+- Dataset dir: `/Users/gregorygoren/Documents/research/avazu-ctr-prediction/`
+  (`train.gz`, `test.gz`, `sampleSubmission.gz` — full canonical Avazu Kaggle
+  CTR dataset, referenced via `consts.RAW_DATA_PATH`)
+
 ## Rules
 
 1. **Code review before any GitHub commit.** Before committing changes to this repo, run a code review (the `/code-review` skill) and address findings first. Never commit straight from a diff without reviewing it.
