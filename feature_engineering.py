@@ -1,4 +1,9 @@
+import math
+
+import numpy as np
 import pandas as pd
+import scipy.sparse as sp
+from scipy.special import expit
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import FeatureUnion, Pipeline
@@ -165,6 +170,152 @@ def build_freq_agg_leaves_concat_pipeline(
         [
             ("raw_freq_agg", build_preprocessing_pipeline(freq_cat_cols, freq_num_cols)),
             ("gbdt_leaves", build_gbdt_leaves_ohe_pipeline(gbdt_cat_cols, gbdt_params=gbdt_params)),
+        ]
+    )
+
+
+class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
+    """Degree-2 Factorization Machine encoder (Rendle, "Factorization
+    Machines", 2010): trains a lightweight FM classifier via minibatch SGD
+    directly on sparse one-hot input, then exposes each row's `n_factors`-dim
+    latent projection `S = X @ v` (the sum of its active one-hot categories'
+    latent vectors) as induced features for a downstream linear model — the
+    FM analog of `GBDTLeafEncoder`'s leaf embeddings.
+
+    No external FM library is used (pyfm/fastFM/xlearn are largely
+    unmaintained C-extension packages — real risk of build failure on modern
+    Python/ARM) — this is a from-scratch, dependency-free implementation
+    sized for this project's scale (up to ~600K raw one-hot columns from
+    `ALL_CAT_FEATURE_COLS`, up to a few million training rows). Update math
+    exploits that one-hot entries are binary (x_i^2 = x_i), which is what
+    lets the sum-of-squared-sums trick collapse the pairwise interaction term
+    (and its gradient) to two sparse matrix multiplies per batch, without
+    ever materializing the full pairwise interaction matrix.
+
+    Only `fit(X_train, y_train)` ever sees labels — `transform` reuses the
+    already-fit `w0_`/`w_`/`v_`, so this satisfies CLAUDE.md's no-leakage
+    rule the same way the rest of this module's fit-on-train-only
+    transformers do.
+    """
+
+    def __init__(
+        self,
+        n_factors: int = 8,
+        n_epochs: int = 5,
+        batch_size: int = 4096,
+        learning_rate: float = 0.05,
+        l2_reg: float = 1e-5,
+        random_state: int | None = None,
+    ):
+        self.n_factors = n_factors
+        self.n_epochs = n_epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.l2_reg = l2_reg
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        X = sp.csr_matrix(X)
+        y = np.asarray(y, dtype=np.float64)
+        n, d = X.shape
+        rng = np.random.default_rng(self.random_state)
+
+        self.w0_ = 0.0
+        self.w_ = np.zeros(d, dtype=np.float64)
+        # Small random init (not zero) is required: with v=0, the latent
+        # projection S=Xv is 0, which makes grad_v identically 0 too (see
+        # below) — a genuine degenerate fixed point that zero-init can never
+        # escape. Small random values break that symmetry.
+        self.v_ = rng.normal(scale=0.01, size=(d, self.n_factors))
+
+        n_batches = max(1, math.ceil(n / self.batch_size))
+        for epoch in range(self.n_epochs):
+            order = rng.permutation(n)
+            epoch_losses = []
+            for batch_idx in np.array_split(order, n_batches):
+                Xb = X[batch_idx]
+                yb = y[batch_idx]
+                nb = len(batch_idx)
+
+                # Restrict all dense (rows x n_factors) work to the columns
+                # actually active in this batch, rather than the full d rows
+                # (up to ~600K) — a typical row only activates ~len(cat_cols)
+                # one-hot columns, so this keeps each step's cost proportional
+                # to the batch's actual sparsity instead of d.
+                active_cols = np.unique(Xb.indices)
+                Xb_active = Xb[:, active_cols]
+                v_active = self.v_[active_cols]
+                w_active = self.w_[active_cols]
+
+                s = Xb_active @ v_active  # (nb, k): sum of active categories' latent vectors
+                sq_sum = Xb_active @ (v_active**2)  # (nb, k): x_i^2 == x_i for binary one-hot input
+                interaction = 0.5 * np.sum(s**2 - sq_sum, axis=1)  # (nb,)
+                z = self.w0_ + Xb_active @ w_active + interaction
+                p = expit(z)
+                p_clipped = np.clip(p, 1e-12, 1 - 1e-12)
+                batch_loss = -np.mean(yb * np.log(p_clipped) + (1 - yb) * np.log(1 - p_clipped))
+                epoch_losses.append((batch_loss, nb))
+
+                err = p - yb  # (nb,) == dL/dz for mean binary cross-entropy
+                g_active = Xb_active.T @ err  # (n_active,)
+                # grad_v[j,f] = mean_i[ err_i * x_i,j * (s_i,f - v_j,f * x_i,j) ], vectorized via
+                # the same x_i^2=x_i trick used for `interaction` above.
+                grad_v_active = (Xb_active.T @ (err[:, None] * s)) / nb - v_active * (g_active / nb)[:, None]
+
+                self.w0_ -= self.learning_rate * err.mean()
+                self.w_[active_cols] -= self.learning_rate * (g_active / nb + self.l2_reg * w_active)
+                self.v_[active_cols] -= self.learning_rate * (grad_v_active + self.l2_reg * v_active)
+            # Sample-weighted average across batches, not a plain mean of
+            # per-batch means — the last batch of an epoch is usually a
+            # different size than the rest (n not evenly divisible by
+            # batch_size), so an unweighted mean would misrepresent the true
+            # epoch loss. This only affects the printed diagnostic, not
+            # training itself (each batch's gradient step already uses that
+            # batch's own correctly-normalized mean).
+            losses, sizes = zip(*epoch_losses, strict=True)
+            weighted_loss = np.average(losses, weights=sizes)
+            print(f"[FMEmbeddingEncoder] epoch {epoch + 1}/{self.n_epochs} mean logloss: {weighted_loss:.4f}")
+        return self
+
+    def transform(self, X):
+        X = sp.csr_matrix(X)
+        return X @ self.v_
+
+
+def build_fm_embed_pipeline(cat_cols: list[str], fm_params: dict | None = None) -> Pipeline:
+    """One-hot -> `FMEmbeddingEncoder`, mirroring `build_gbdt_leaves_ohe_pipeline`'s
+    shape: the FM trains on raw uncapped one-hot vectors (same columns as
+    `baseline_ohe`), and each row's latent projection is exposed as induced
+    features. Reused by `build_freq_agg_fm_concat_pipeline` below.
+    """
+    return Pipeline(
+        [
+            ("ohe", build_ohe_only_pipeline(cat_cols)),
+            ("fm", FMEmbeddingEncoder(**(fm_params or {}))),
+        ]
+    )
+
+
+def build_freq_agg_fm_concat_pipeline(
+    freq_cat_cols: list[str],
+    freq_num_cols: list[str],
+    fm_cat_cols: list[str],
+    fm_params: dict | None = None,
+) -> FeatureUnion:
+    """`freq_agg_fm_concat` feature set: concatenates `freq_agg`'s engineered
+    features (capped context one-hot + smoothed target-encoded user/ad
+    aggregates + hour) with `FMEmbeddingEncoder`'s latent projection features
+    (via `build_fm_embed_pipeline`, trained on raw uncapped one-hot vectors)
+    — mirrors `freq_agg_leaves_concat`'s design (GBDT trained on plain
+    one-hot, not on freq_agg's own LOO-adjusted `_ctr`/`_count` columns), for
+    the same reason: those columns carry a small train-only leave-one-out
+    artifact that a flexible second model can exploit, so the induced-feature
+    model should train on plain one-hot instead.
+    """
+    return FeatureUnion(
+        [
+            ("raw_freq_agg", build_preprocessing_pipeline(freq_cat_cols, freq_num_cols)),
+            ("fm_embed", build_fm_embed_pipeline(fm_cat_cols, fm_params=fm_params)),
         ]
     )
 

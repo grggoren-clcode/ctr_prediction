@@ -59,3 +59,17 @@ GBDT_LEAF_ENCODER_PARAMS = {
     "bagging_fraction": 0.8,
     "bagging_freq": 1,
 }
+
+# Defaults for feature_engineering.FMEmbeddingEncoder (the `freq_agg_fm_concat`
+# feature set's internal Factorization Machine). n_factors is the latent
+# embedding dimension — kept small (8) since these become concatenated input
+# features for the downstream LR, not the final prediction themselves.
+# random_state is deliberately excluded — trainer.py merges in args.seed at
+# construction time, same as GBDT_LEAF_ENCODER_PARAMS above.
+FM_ENCODER_PARAMS = {
+    "n_factors": 8,
+    "n_epochs": 5,
+    "batch_size": 4096,
+    "learning_rate": 0.05,
+    "l2_reg": 1e-5,
+}

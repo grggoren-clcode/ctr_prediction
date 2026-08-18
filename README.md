@@ -100,6 +100,16 @@ fraction of the sample), `--data-path` (override the raw data location).
   directly on freq_agg's dense matrix scored AUC ~0.48 (worse than random) on
   held-out val, because its leaf splits encoded that train-only artifact
   rather than transferable signal. Also intended for `--model logreg`.
+- **`--feature-set freq_agg_fm_concat`**: same idea as `freq_agg_leaves_concat`,
+  but the induced features come from a Factorization Machine
+  (`feature_engineering.FMEmbeddingEncoder`) instead of a GBDT — a lightweight,
+  dependency-free degree-2 FM (Rendle, 2010) trained via minibatch SGD
+  directly on raw uncapped one-hot vectors, exposing each row's `n_factors`-dim
+  latent projection (the sum of its active categories' learned latent
+  vectors) as concatenated features alongside `freq_agg`'s. No external FM
+  library is used (pyfm/fastFM/xlearn are largely unmaintained C-extension
+  packages, high risk of build failure on modern Python/ARM). Also intended
+  for `--model logreg`.
 
 ## Exploration
 
