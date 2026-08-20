@@ -4,10 +4,11 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from scipy.special import expit
-from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.utils.class_weight import compute_sample_weight
 
 from consts import HOUR_COL, LABEL_COL
 
@@ -174,23 +175,189 @@ def build_freq_agg_leaves_concat_pipeline(
     )
 
 
+def _fm_forward(X: sp.csr_matrix, w0: float, w: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The degree-2 FM forward pass — `z = w0 + Xw + interaction`, plus the
+    per-row latent projection `s = Xv` (needed separately, alongside `z`,
+    for `_fit_fm_sgd`'s gradient computation). Exploits `x_i^2 = x_i` for
+    binary one-hot input to reduce the pairwise interaction term to two
+    sparse matrix multiplies, without ever materializing the full pairwise
+    interaction matrix. Shared by `_fit_fm_sgd`'s training loop and
+    `FMClassifier.predict_proba` so the two can never drift out of sync —
+    the same forward pass must produce the same score whether it's being
+    evaluated during training or at inference time.
+    """
+    s = X @ v  # (n, k): sum of active categories' latent vectors
+    sq_sum = X @ (v**2)  # (n, k): x_i^2 == x_i for binary one-hot input
+    interaction = 0.5 * np.sum(s**2 - sq_sum, axis=1)  # (n,)
+    z = w0 + X @ w + interaction
+    return z, s
+
+
+def _fit_fm_sgd(
+    X: sp.csr_matrix,
+    y: np.ndarray,
+    n_factors: int,
+    n_epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    l2_reg: float,
+    early_stopping_patience: int,
+    early_stopping_tol: float,
+    random_state: int | None,
+    sample_weight: np.ndarray | None = None,
+    log_prefix: str = "FM",
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Minibatch-SGD training loop shared by `FMEmbeddingEncoder` and
+    `FMClassifier` — both fit the exact same degree-2 FM
+    (`w0 + Xw + pairwise interaction`, via `_fm_forward`), they just differ
+    in what they *do* with the result: `FMEmbeddingEncoder` keeps only `v`
+    (as induced features for a downstream linear model), `FMClassifier`
+    uses all three as its own prediction. Returns `(w0, w_, v_)` — the
+    weights from the **best** (lowest-loss) epoch seen during training, not
+    necessarily the last one (loss can wobble slightly upward near
+    convergence; without snapshotting, an unlucky final epoch would ship
+    strictly worse weights than an earlier one already reached).
+
+    `sample_weight`, if given, is a per-training-row weight (e.g. from
+    `sklearn.utils.class_weight.compute_sample_weight`) folded into every
+    batch average/gradient in place of the plain row count. When
+    `sample_weight=None`, it's treated as all-ones (computed once here, not
+    reconstructed per batch), so every formula below collapses back to
+    exactly the unweighted arithmetic — this is what makes the refactor a
+    verified no-op for `FMEmbeddingEncoder`, which must stay behaviorally
+    identical. A batch whose sample weights happen to sum to exactly 0
+    (e.g. a custom `class_weight` dict assigning weight 0 to a class, and an
+    unlucky batch drawn entirely from that class) is skipped outright rather
+    than dividing by zero and poisoning the weights with NaN.
+
+    Raises `FloatingPointError` if the loss ever becomes non-finite (e.g.
+    `learning_rate` too high for this data) — silently continuing would
+    otherwise leave `best_w0_`/`best_w`/`best_v` pinned at their untrained
+    random-init values forever (`NaN < best_loss` is always `False`, so the
+    "new best" snapshot condition below can never fire again), and the
+    function would return an effectively-random, silently-broken model
+    instead of failing loudly at the point of divergence.
+    """
+    n, d = X.shape
+    if X.data.size and not np.array_equal(np.unique(X.data), np.array([1.0])):
+        raise ValueError(
+            "_fit_fm_sgd requires binary (0/1) one-hot input — the x_i^2 = x_i identity "
+            "the interaction term and its gradient rely on does not hold otherwise."
+        )
+    rng = np.random.default_rng(random_state)
+    sample_weight = np.ones(n, dtype=np.float64) if sample_weight is None else sample_weight
+
+    w0 = 0.0
+    w_ = np.zeros(d, dtype=np.float64)
+    # Small random init (not zero) is required: with v=0, the latent
+    # projection S=Xv is 0, which makes grad_v identically 0 too (see
+    # below) — a genuine degenerate fixed point that zero-init can never
+    # escape. Small random values break that symmetry.
+    v_ = rng.normal(scale=0.01, size=(d, n_factors))
+    best_w0, best_w, best_v = w0, w_.copy(), v_.copy()
+
+    n_batches = max(1, math.ceil(n / batch_size))
+    best_loss = np.inf
+    epochs_without_improvement = 0
+    for epoch in range(n_epochs):
+        order = rng.permutation(n)
+        epoch_losses = []
+        for batch_idx in np.array_split(order, n_batches):
+            Xb = X[batch_idx]
+            yb = y[batch_idx]
+            swb = sample_weight[batch_idx]
+            denom = swb.sum()
+            if denom == 0:
+                continue
+
+            # Restrict all dense (rows x n_factors) work to the columns
+            # actually active in this batch, rather than the full d rows
+            # (up to ~600K) — a typical row only activates ~len(cat_cols)
+            # one-hot columns, so this keeps each step's cost proportional
+            # to the batch's actual sparsity instead of d.
+            active_cols = np.unique(Xb.indices)
+            Xb_active = Xb[:, active_cols]
+            v_active = v_[active_cols]
+            w_active = w_[active_cols]
+
+            z, s = _fm_forward(Xb_active, w0, w_active, v_active)
+            p = expit(z)
+            p_clipped = np.clip(p, 1e-12, 1 - 1e-12)
+            batch_loss = -np.sum(swb * (yb * np.log(p_clipped) + (1 - yb) * np.log(1 - p_clipped))) / denom
+            epoch_losses.append((batch_loss, denom))
+
+            err = swb * (p - yb)  # (nb,) == weighted dL/dz for mean binary cross-entropy
+            g_active = Xb_active.T @ err  # (n_active,)
+            # grad_v[j,f] = sum_i[ err_i * x_i,j * (s_i,f - v_j,f * x_i,j) ] / denom, vectorized
+            # via the same x_i^2=x_i trick used inside _fm_forward.
+            grad_v_active = (Xb_active.T @ (err[:, None] * s)) / denom - v_active * (g_active / denom)[:, None]
+
+            w0 -= learning_rate * (err.sum() / denom)
+            w_[active_cols] -= learning_rate * (g_active / denom + l2_reg * w_active)
+            v_[active_cols] -= learning_rate * (grad_v_active + l2_reg * v_active)
+
+        if not epoch_losses:
+            # Every batch this epoch had zero total sample weight (only
+            # possible with a pathological custom class_weight) — nothing
+            # to log or evaluate for early stopping, move on.
+            continue
+        # Sample-weighted average across batches, not a plain mean of
+        # per-batch means — the last batch of an epoch is usually a
+        # different size than the rest (n not evenly divisible by
+        # batch_size), so an unweighted mean would misrepresent the true
+        # epoch loss. This only affects the printed diagnostic, not
+        # training itself (each batch's gradient step already uses that
+        # batch's own correctly-normalized mean).
+        losses, sizes = zip(*epoch_losses, strict=True)
+        weighted_loss = np.average(losses, weights=sizes)
+        print(f"[{log_prefix}] epoch {epoch + 1}/{n_epochs} mean logloss: {weighted_loss:.4f}")
+        if not np.isfinite(weighted_loss):
+            raise FloatingPointError(
+                f"[{log_prefix}] training diverged (non-finite loss) at epoch {epoch + 1}/{n_epochs} — "
+                "try a lower learning_rate or higher l2_reg."
+            )
+
+        # Plateau-based early stopping on training loss: guards against
+        # silently wasting compute (or, if a future n_epochs bump pushes
+        # well past convergence, overfitting) when nobody's watching the
+        # printed per-epoch loss. Judges "improvement" against the best
+        # loss seen so far (not just the previous epoch), since the loss
+        # can wobble slightly upward between epochs near convergence
+        # without that meaning training has actually plateaued. Whenever a
+        # new best is reached, snapshot the weights that achieved it — the
+        # function returns this snapshot, not whatever epoch training
+        # happens to end on.
+        if weighted_loss < best_loss - early_stopping_tol:
+            best_loss = weighted_loss
+            best_w0, best_w, best_v = w0, w_.copy(), v_.copy()
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= early_stopping_patience:
+                print(
+                    f"[{log_prefix}] early stopping at epoch {epoch + 1}/{n_epochs} "
+                    f"(no improvement > {early_stopping_tol} for {early_stopping_patience} epochs)"
+                )
+                break
+    return best_w0, best_w, best_v
+
+
 class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
     """Degree-2 Factorization Machine encoder (Rendle, "Factorization
     Machines", 2010): trains a lightweight FM classifier via minibatch SGD
-    directly on sparse one-hot input, then exposes each row's `n_factors`-dim
-    latent projection `S = X @ v` (the sum of its active one-hot categories'
-    latent vectors) as induced features for a downstream linear model — the
-    FM analog of `GBDTLeafEncoder`'s leaf embeddings.
+    directly on sparse one-hot input (see `_fit_fm_sgd`), then exposes each
+    row's `n_factors`-dim latent projection `S = X @ v` (the sum of its
+    active one-hot categories' latent vectors) as induced features for a
+    downstream linear model — the FM analog of `GBDTLeafEncoder`'s leaf
+    embeddings. For a variant that uses the FM as a standalone classifier
+    in its own right (exposing the full `w0 + Xw + interaction` logit
+    instead of only `v`), see `FMClassifier` below.
 
     No external FM library is used (pyfm/fastFM/xlearn are largely
     unmaintained C-extension packages — real risk of build failure on modern
     Python/ARM) — this is a from-scratch, dependency-free implementation
     sized for this project's scale (up to ~600K raw one-hot columns from
-    `ALL_CAT_FEATURE_COLS`, up to a few million training rows). Update math
-    exploits that one-hot entries are binary (x_i^2 = x_i), which is what
-    lets the sum-of-squared-sums trick collapse the pairwise interaction term
-    (and its gradient) to two sparse matrix multiplies per batch, without
-    ever materializing the full pairwise interaction matrix.
+    `ALL_CAT_FEATURE_COLS`, up to a few million training rows).
 
     Only `fit(X_train, y_train)` ever sees labels — `transform` reuses the
     already-fit `w0_`/`w_`/`v_`, so this satisfies CLAUDE.md's no-leakage
@@ -202,6 +369,14 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
     `early_stopping_tol` triggers, so raising `n_epochs` to explore whether
     more training helps is safe by default rather than risking silent
     overfitting on an unattended run.
+
+    This class and `FMClassifier` intentionally duplicate the same SGD
+    hyperparameters in their `__init__` signatures rather than sharing one
+    via inheritance — sklearn's `get_params()`/`clone()` introspect each
+    estimator's own `__init__` signature, so keeping every parameter
+    literal and explicit here (the sklearn-recommended pattern) is more
+    reliable than a shared base `__init__`. If you change a default here,
+    check whether `FMClassifier`'s should change too.
     """
 
     def __init__(
@@ -227,90 +402,121 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
     def fit(self, X, y):
         X = sp.csr_matrix(X)
         y = np.asarray(y, dtype=np.float64)
-        n, d = X.shape
-        rng = np.random.default_rng(self.random_state)
-
-        self.w0_ = 0.0
-        self.w_ = np.zeros(d, dtype=np.float64)
-        # Small random init (not zero) is required: with v=0, the latent
-        # projection S=Xv is 0, which makes grad_v identically 0 too (see
-        # below) — a genuine degenerate fixed point that zero-init can never
-        # escape. Small random values break that symmetry.
-        self.v_ = rng.normal(scale=0.01, size=(d, self.n_factors))
-
-        n_batches = max(1, math.ceil(n / self.batch_size))
-        best_loss = np.inf
-        epochs_without_improvement = 0
-        for epoch in range(self.n_epochs):
-            order = rng.permutation(n)
-            epoch_losses = []
-            for batch_idx in np.array_split(order, n_batches):
-                Xb = X[batch_idx]
-                yb = y[batch_idx]
-                nb = len(batch_idx)
-
-                # Restrict all dense (rows x n_factors) work to the columns
-                # actually active in this batch, rather than the full d rows
-                # (up to ~600K) — a typical row only activates ~len(cat_cols)
-                # one-hot columns, so this keeps each step's cost proportional
-                # to the batch's actual sparsity instead of d.
-                active_cols = np.unique(Xb.indices)
-                Xb_active = Xb[:, active_cols]
-                v_active = self.v_[active_cols]
-                w_active = self.w_[active_cols]
-
-                s = Xb_active @ v_active  # (nb, k): sum of active categories' latent vectors
-                sq_sum = Xb_active @ (v_active**2)  # (nb, k): x_i^2 == x_i for binary one-hot input
-                interaction = 0.5 * np.sum(s**2 - sq_sum, axis=1)  # (nb,)
-                z = self.w0_ + Xb_active @ w_active + interaction
-                p = expit(z)
-                p_clipped = np.clip(p, 1e-12, 1 - 1e-12)
-                batch_loss = -np.mean(yb * np.log(p_clipped) + (1 - yb) * np.log(1 - p_clipped))
-                epoch_losses.append((batch_loss, nb))
-
-                err = p - yb  # (nb,) == dL/dz for mean binary cross-entropy
-                g_active = Xb_active.T @ err  # (n_active,)
-                # grad_v[j,f] = mean_i[ err_i * x_i,j * (s_i,f - v_j,f * x_i,j) ], vectorized via
-                # the same x_i^2=x_i trick used for `interaction` above.
-                grad_v_active = (Xb_active.T @ (err[:, None] * s)) / nb - v_active * (g_active / nb)[:, None]
-
-                self.w0_ -= self.learning_rate * err.mean()
-                self.w_[active_cols] -= self.learning_rate * (g_active / nb + self.l2_reg * w_active)
-                self.v_[active_cols] -= self.learning_rate * (grad_v_active + self.l2_reg * v_active)
-            # Sample-weighted average across batches, not a plain mean of
-            # per-batch means — the last batch of an epoch is usually a
-            # different size than the rest (n not evenly divisible by
-            # batch_size), so an unweighted mean would misrepresent the true
-            # epoch loss. This only affects the printed diagnostic, not
-            # training itself (each batch's gradient step already uses that
-            # batch's own correctly-normalized mean).
-            losses, sizes = zip(*epoch_losses, strict=True)
-            weighted_loss = np.average(losses, weights=sizes)
-            print(f"[FMEmbeddingEncoder] epoch {epoch + 1}/{self.n_epochs} mean logloss: {weighted_loss:.4f}")
-
-            # Plateau-based early stopping on training loss: guards against
-            # silently wasting compute (or, if a future n_epochs bump pushes
-            # well past convergence, overfitting) when nobody's watching the
-            # printed per-epoch loss. Judges "improvement" against the best
-            # loss seen so far (not just the previous epoch), since the loss
-            # can wobble slightly upward between epochs near convergence
-            # without that meaning training has actually plateaued.
-            if weighted_loss < best_loss - self.early_stopping_tol:
-                best_loss = weighted_loss
-                epochs_without_improvement = 0
-            else:
-                epochs_without_improvement += 1
-                if epochs_without_improvement >= self.early_stopping_patience:
-                    print(
-                        f"[FMEmbeddingEncoder] early stopping at epoch {epoch + 1}/{self.n_epochs} "
-                        f"(no improvement > {self.early_stopping_tol} for {self.early_stopping_patience} epochs)"
-                    )
-                    break
+        self.w0_, self.w_, self.v_ = _fit_fm_sgd(
+            X,
+            y,
+            n_factors=self.n_factors,
+            n_epochs=self.n_epochs,
+            batch_size=self.batch_size,
+            learning_rate=self.learning_rate,
+            l2_reg=self.l2_reg,
+            early_stopping_patience=self.early_stopping_patience,
+            early_stopping_tol=self.early_stopping_tol,
+            random_state=self.random_state,
+            sample_weight=None,
+            log_prefix="FMEmbeddingEncoder",
+        )
         return self
 
     def transform(self, X):
         X = sp.csr_matrix(X)
         return X @ self.v_
+
+
+class FMClassifier(BaseEstimator, ClassifierMixin):
+    """Degree-2 Factorization Machine (Rendle, "Factorization Machines",
+    2010) as a genuine standalone classifier — literally the textbook FM,
+    `ŷ(x) = w0 + Σ w_i x_i + Σ_{i<j} ⟨v_i, v_j⟩ x_i x_j`, trained end-to-end
+    as a single jointly-optimized model. Unlike `FMEmbeddingEncoder` — which
+    fits the exact same objective via the same shared `_fit_fm_sgd` training
+    loop, but discards `w0`/`w` and exposes only the latent projection `v`
+    as induced features for a *separately*-trained `LogisticRegression` —
+    this class exposes the already-computed full FM logit
+    `z = w0 + Xw + interaction` directly as `predict_proba`, so there is no
+    second, independently-trained linear model layered on top.
+
+    Only usable with pure one-hot input (e.g. the `baseline_ohe` feature
+    set): the `x_i^2 = x_i` identity the training/prediction math relies on
+    does not hold for continuous features like `freq_agg`'s `_ctr`/`_count`
+    columns — see `trainer.FEATURE_SET_COMPATIBLE_MODELS`, which restricts
+    `"fm"` to `"baseline_ohe"` only, for this reason.
+
+    `class_weight` mirrors `sklearn.linear_model.LogisticRegression`'s
+    parameter of the same name (`trainer.get_model` passes
+    `class_weight="balanced"` for this model, matching the `"logreg"`
+    baseline, since Avazu's ~17% base CTR means an unweighted BCE loss
+    under-attends to clicks) — `"balanced"` reweights each training row by
+    `n_samples / (n_classes * n_samples_of_its_class)` via
+    `sklearn.utils.class_weight.compute_sample_weight`, computed once over
+    the full training set and threaded through every average/gradient
+    normalization in `_fit_fm_sgd`. Defaults to `None` (unweighted), same as
+    `LogisticRegression`'s own default.
+
+    Binary classification only (the model and its BCE loss are inherently
+    binary) — `classes_` is set from the training labels per
+    `sklearn.base.ClassifierMixin` convention, and `fit` raises if more than
+    two classes are present.
+    """
+
+    def __init__(
+        self,
+        n_factors: int = 8,
+        n_epochs: int = 5,
+        batch_size: int = 4096,
+        learning_rate: float = 0.05,
+        l2_reg: float = 1e-5,
+        early_stopping_patience: int = 3,
+        early_stopping_tol: float = 1e-4,
+        class_weight: str | dict | None = None,
+        random_state: int | None = None,
+    ):
+        self.n_factors = n_factors
+        self.n_epochs = n_epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.l2_reg = l2_reg
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_tol = early_stopping_tol
+        self.class_weight = class_weight
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        X = sp.csr_matrix(X)
+        y_arr = np.asarray(y)
+        self.classes_ = np.unique(y_arr)
+        if len(self.classes_) != 2:
+            raise ValueError(f"FMClassifier only supports binary classification, got classes={self.classes_}")
+        # Map to canonical {0.0, 1.0} via classes_ rather than assuming labels
+        # are already literally 0/1 — classes_[1] (the larger of the two sorted
+        # unique values) is "positive", matching sklearn's own convention that
+        # predict_proba's column 1 corresponds to classes_[1].
+        y_float = (y_arr == self.classes_[1]).astype(np.float64)
+        sample_weight = compute_sample_weight(self.class_weight, y_arr)
+        self.w0_, self.w_, self.v_ = _fit_fm_sgd(
+            X,
+            y_float,
+            n_factors=self.n_factors,
+            n_epochs=self.n_epochs,
+            batch_size=self.batch_size,
+            learning_rate=self.learning_rate,
+            l2_reg=self.l2_reg,
+            early_stopping_patience=self.early_stopping_patience,
+            early_stopping_tol=self.early_stopping_tol,
+            random_state=self.random_state,
+            sample_weight=sample_weight,
+            log_prefix="FMClassifier",
+        )
+        return self
+
+    def predict_proba(self, X):
+        X = sp.csr_matrix(X)
+        z, _s = _fm_forward(X, self.w0_, self.w_, self.v_)
+        p = expit(z)
+        return np.column_stack([1 - p, p])
+
+    def predict(self, X):
+        idx = (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+        return self.classes_[idx]
 
 
 def build_fm_embed_pipeline(cat_cols: list[str], fm_params: dict | None = None) -> Pipeline:

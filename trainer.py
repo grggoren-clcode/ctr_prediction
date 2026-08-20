@@ -26,6 +26,7 @@ from consts import (
 from data_loader import load_sample, time_based_split, validate_schema
 from evaluator import evaluate, print_metrics
 from feature_engineering import (
+    FMClassifier,
     GBDTLeafEncoder,
     add_freq_agg_features,
     add_hour_features,
@@ -52,6 +53,13 @@ def get_model(model_name: str, **kwargs):
         except ImportError as e:
             raise ImportError("lightgbm is not installed; pip install lightgbm to use this model") from e
         return lgb.LGBMClassifier(**kwargs)
+    if model_name == "fm":
+        # FM_ENCODER_PARAMS was tuned for FMEmbeddingEncoder's role as a
+        # feature-inducer feeding a downstream LR (see consts.py's tuning
+        # history) — reused here as a starting point, but this standalone
+        # classifier role is different enough that it may warrant its own
+        # separate tuning pass later.
+        return FMClassifier(class_weight="balanced", **{**FM_ENCODER_PARAMS, **kwargs})
     raise ValueError(f"Unknown model_name: {model_name!r}")
 
 
@@ -129,7 +137,11 @@ def build_gbdt_leaf_features(train_df, val_df):
 # sparse one-hot leaves.
 FEATURE_SET_COMPATIBLE_MODELS = {
     "freq_agg": {"logreg", "hist_gbdt", "lightgbm"},
-    "baseline_ohe": {"logreg", "lightgbm"},
+    # "fm" (FMClassifier) is restricted to baseline_ohe specifically — its
+    # training/prediction math relies on x_i^2 = x_i, which only holds for
+    # pure one-hot columns, not e.g. freq_agg's continuous _ctr/_count
+    # columns or the concatenated/leaf-derived feature sets below.
+    "baseline_ohe": {"logreg", "lightgbm", "fm"},
     "gbdt_leaves": {"logreg", "lightgbm"},
     "gbdt_leaves_ohe": {"logreg", "lightgbm"},
     "gbdt_leaves_concat": {"logreg", "lightgbm"},
@@ -264,7 +276,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=Path, default=RAW_DATA_PATH)
     parser.add_argument("--n-rows", type=int, default=SAMPLE_N_ROWS)
-    parser.add_argument("--model", default="hist_gbdt", choices=["logreg", "hist_gbdt", "lightgbm"])
+    parser.add_argument("--model", default="hist_gbdt", choices=["logreg", "hist_gbdt", "lightgbm", "fm"])
     parser.add_argument(
         "--feature-set",
         default="freq_agg",

@@ -61,9 +61,13 @@ GBDT_LEAF_ENCODER_PARAMS = {
 }
 
 # Defaults for feature_engineering.FMEmbeddingEncoder (the `freq_agg_fm_concat`
-# feature set's internal Factorization Machine). n_factors is the latent
-# embedding dimension — kept modest (16) since these become concatenated
-# input features for the downstream LR, not the final prediction themselves.
+# feature set's internal Factorization Machine) AND feature_engineering.FMClassifier
+# (the standalone `--model fm` classifier, used with `--feature-set baseline_ohe` —
+# see trainer.get_model). n_factors is the latent embedding dimension — kept
+# modest (16) since for FMEmbeddingEncoder these become concatenated input
+# features for a downstream LR, not the final prediction; FMClassifier reuses
+# the same value as a starting point despite training as the final classifier
+# itself, a different role that may warrant its own separate tuning pass later.
 # random_state is deliberately excluded — trainer.py merges in args.seed at
 # construction time, same as GBDT_LEAF_ENCODER_PARAMS above.
 #

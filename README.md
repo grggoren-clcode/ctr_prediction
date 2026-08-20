@@ -61,8 +61,13 @@ fraction of the sample), `--data-path` (override the raw data location).
   user/ad columns. Pairs with any `--model`.
 - **`--feature-set baseline_ohe`**: every raw categorical column (including
   `device_id`/`device_ip`/`site_id`/`app_id`) one-hot encoded, uncapped, sparse —
-  a naive baseline with no target-encoding. Intended for `--model logreg` (sparse
-  input; `hist_gbdt` needs dense and this matrix is too wide to densify).
+  a naive baseline with no target-encoding. Intended for `--model logreg` or
+  `--model fm` (sparse input; `hist_gbdt` needs dense and this matrix is too wide
+  to densify). `--model fm` trains `feature_engineering.FMClassifier` — a
+  standalone, jointly-optimized degree-2 Factorization Machine (`ŷ(x) = w0 +
+  Σwᵢxᵢ + Σ⟨vᵢ,vⱼ⟩xᵢxⱼ`) used directly as the classifier, as opposed to
+  `gbdt_leaves_ohe`-style techniques where an internal model's output only
+  ever feeds a separately-trained linear model.
 - **`--feature-set gbdt_leaves`**: the Facebook GBDT+LR technique — a lightgbm
   GBDT trains on the raw categorical + hour columns (via lightgbm's native
   categorical handling), then each row is re-encoded as the one-hot
