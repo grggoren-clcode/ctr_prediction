@@ -23,6 +23,18 @@ VAL_FRAC = 0.2
 # Avazu has no true user_id.
 USER_FEATURE_COLS = ["device_id", "device_ip", "device_model", "device_type", "device_conn_type"]
 AD_FEATURE_COLS = ["site_id", "site_domain", "site_category", "app_id", "app_domain", "app_category"]
+# Child->parent pairs within AD_FEATURE_COLS trustworthy enough to use as
+# feature_engineering.build_hierarchy_parent_map's back-off targets (for
+# feature_engineering._fit_fm_sgd's hierarchical back-off regularization).
+# Verified via groupby on the real 2M-row sample: site_id -> site_domain is
+# 99.06% mode-consistent at the row level, app_id -> app_domain is 100% clean
+# (a true function). The next level up is NOT trustworthy and is deliberately
+# excluded: site_domain -> site_category and app_domain -> app_category are
+# far from 1:1 (47.7% and 92.1% of rows respectively touch an ambiguous
+# domain — one dominant app_domain alone spans 1.37M/2M rows across multiple
+# categories), so a mode-fallback there would pull rare ids toward
+# frequently-wrong targets for a large fraction of rows.
+AD_HIERARCHY_PAIRS = [("site_id", "site_domain"), ("app_id", "app_domain")]
 # hour is handled separately (drives the split + derived hour_of_day/day_of_week), so it's
 # excluded here to avoid double-listing.
 CONTEXT_FEATURE_COLS = ["C1", "banner_pos", "C14", "C15", "C16", "C17", "C18", "C19", "C20", "C21"]

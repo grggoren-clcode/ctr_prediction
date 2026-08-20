@@ -75,6 +75,33 @@ fraction of the sample), `--data-path` (override the raw data location).
   hyperparameter confound, after a diagnostic found most of `fm`'s gap versus
   `--model logreg` traced back to optimizer quality rather than the pairwise
   term itself (see `FM_CLASSIFIER_PARAMS`/`SGD_LOGREG_PARAMS` in `consts.py`).
+
+  `--model fm`/`sgd_logreg` also expose two opt-in, default-disabled
+  regularization extensions aimed at undertrained embeddings of rare
+  one-hot columns: `--freq-shrink-alpha`/`--freq-shrink-m` (frequency-
+  adaptive L2 shrinkage — scales `l2_reg` up for rarely-seen columns; works
+  for both `fm` and `sgd_logreg`, since it applies to `w` too) and
+  `--hierarchy-beta`/`--hierarchy-m` (hierarchical back-off — pulls a rare
+  `site_id`/`app_id`'s embedding toward its `site_domain`/`app_domain`'s
+  embedding instead of toward zero; **`--model fm` only** — `sgd_logreg`
+  forces `n_factors=0`, so there's no embedding for this term to act on, and
+  `trainer.py`/`_fit_fm_sgd` both reject `--hierarchy-beta > 0` combined with
+  `sgd_logreg` rather than silently no-op; requires `--feature-set
+  baseline_ohe`).
+  Both are implemented in `feature_engineering._fit_fm_sgd` and verified
+  correct (finite-difference gradient checks + a synthetic planted-hierarchy
+  test confirming rare embeddings measurably move toward their parent's).
+  **Neither is enabled by default**: a staged sweep + full-scale (2M-row)
+  validation found `freq_shrink_alpha` has no measurable effect at any
+  practical strength (`FM_CLASSIFIER_PARAMS`' `l2_reg=1e-5` is too small for
+  even a large multiplier to matter), and `hierarchy_beta` is neutral-to-
+  slightly-negative at full scale (small AUC cost, negligible logloss
+  change) despite a promising-looking signal on small samples — a case of
+  the small-sample sweep not replicating at scale, consistent with this
+  project's established validate-at-full-scale rule. Left in as opt-in
+  tools for future exploration (e.g. alongside different `l2_reg`/`n_factors`
+  choices) rather than removed, since the underlying mechanism is verified
+  correct even though it doesn't help this particular tuned configuration.
 - **`--feature-set gbdt_leaves`**: the Facebook GBDT+LR technique — a lightgbm
   GBDT trains on the raw categorical + hour columns (via lightgbm's native
   categorical handling), then each row is re-encoded as the one-hot

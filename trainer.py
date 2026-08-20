@@ -9,6 +9,7 @@ from sklearn.pipeline import Pipeline
 
 from consts import (
     AD_FEATURE_COLS,
+    AD_HIERARCHY_PAIRS,
     ALL_CAT_FEATURE_COLS,
     CONTEXT_FEATURE_COLS,
     FM_CLASSIFIER_PARAMS,
@@ -28,6 +29,8 @@ from consts import (
 from data_loader import load_sample, time_based_split, validate_schema
 from evaluator import evaluate, print_metrics
 from feature_engineering import (
+    DEFAULT_FREQ_SHRINK_M,
+    DEFAULT_HIERARCHY_M,
     FMClassifier,
     GBDTLeafEncoder,
     add_freq_agg_features,
@@ -36,6 +39,7 @@ from feature_engineering import (
     build_freq_agg_leaves_concat_pipeline,
     build_gbdt_leaves_concat_pipeline,
     build_gbdt_leaves_ohe_pipeline,
+    build_hierarchy_parent_map,
     build_ohe_only_pipeline,
     build_preprocessing_pipeline,
     to_lgbm_categoricals,
@@ -304,9 +308,36 @@ def main():
     parser.add_argument("--val-frac", type=float, default=VAL_FRAC)
     parser.add_argument("--output-dir", type=Path, default=OUTPUTS_DIR)
     parser.add_argument("--seed", type=int, default=RANDOM_SEED)
+    parser.add_argument(
+        "--freq-shrink-alpha",
+        type=float,
+        default=0.0,
+        help="fm/sgd_logreg only: frequency-adaptive L2 shrinkage strength for rare one-hot "
+        "columns (0 = disabled, matches current behavior)",
+    )
+    parser.add_argument("--freq-shrink-m", type=float, default=DEFAULT_FREQ_SHRINK_M)
+    parser.add_argument(
+        "--hierarchy-beta",
+        type=float,
+        default=0.0,
+        help="fm/sgd_logreg + baseline_ohe only: hierarchical back-off strength pulling rare "
+        "site_id/app_id embeddings toward their site_domain/app_domain embedding "
+        "(0 = disabled, matches current behavior)",
+    )
+    parser.add_argument("--hierarchy-m", type=float, default=DEFAULT_HIERARCHY_M)
     args = parser.parse_args()
 
     check_feature_set_model_compatible(args.feature_set, args.model)
+    if args.freq_shrink_alpha > 0 and args.model not in ("fm", "sgd_logreg"):
+        raise ValueError("--freq-shrink-alpha > 0 requires --model fm or sgd_logreg")
+    hierarchy_enabled = args.hierarchy_beta > 0
+    if hierarchy_enabled and not (args.model == "fm" and args.feature_set == "baseline_ohe"):
+        # sgd_logreg is deliberately excluded here, not just baseline_ohe/fm-
+        # only: it forces n_factors=0 (trainer.get_model), so the hierarchy
+        # term — which only ever touches v_ (shape (d, 0) there) — would be a
+        # silent no-op rather than a real regularizer. _fit_fm_sgd itself
+        # also raises if this is ever bypassed via a direct FMClassifier call.
+        raise ValueError("--hierarchy-beta > 0 requires --model fm (not sgd_logreg) and --feature-set baseline_ohe")
 
     df = load_sample(path=args.data_path, n_rows=args.n_rows)
     validate_schema(df)
@@ -316,12 +347,40 @@ def main():
     train_df, val_df, feature_cols, state = engineer_features(args.feature_set, train_df, val_df)
     preprocessor = build_preprocessor(args.feature_set, state, args.seed)
 
-    model = get_model(args.model, random_state=args.seed)
-    pipeline = Pipeline([("preprocess", preprocessor), ("model", model)])
+    model_kwargs = {"random_state": args.seed}
+    if args.model in ("fm", "sgd_logreg"):
+        model_kwargs["freq_shrink_alpha"] = args.freq_shrink_alpha
+        model_kwargs["freq_shrink_m"] = args.freq_shrink_m
 
-    train_model(pipeline, train_df[feature_cols], train_df[LABEL_COL])
+    if hierarchy_enabled:
+        # Hierarchical back-off needs the fitted OneHotEncoder's categories_
+        # to build the child->parent column-index map, which a single
+        # Pipeline.fit() call never exposes a seam for between the
+        # "preprocess" and "model" steps — so unroll them manually here.
+        # Every other case (the vast majority of runs) keeps the original
+        # single-pipeline.fit() path in the else branch below untouched.
+        # Pipeline([...]) is reassembled from the already-fitted steps
+        # afterward purely for save_model's artifact bundling below —
+        # Pipeline.predict_proba/.transform only delegate to each step's own
+        # fitted state, with no bookkeeping tied to whether .fit() was
+        # called on the Pipeline object itself, so this is safe.
+        X_train = preprocessor.fit_transform(train_df[feature_cols])
+        ohe = preprocessor.named_transformers_["cat"]
+        parent_idx = build_hierarchy_parent_map(train_df, state["cat_cols"], ohe, AD_HIERARCHY_PAIRS)
+        model_kwargs["hierarchy_parent_idx"] = parent_idx
+        model_kwargs["hierarchy_beta"] = args.hierarchy_beta
+        model_kwargs["hierarchy_m"] = args.hierarchy_m
+        model = get_model(args.model, **model_kwargs)
+        train_model(model, X_train, train_df[LABEL_COL])
+        X_val = preprocessor.transform(val_df[feature_cols])
+        val_pred_proba = model.predict_proba(X_val)[:, 1]
+        pipeline = Pipeline([("preprocess", preprocessor), ("model", model)])
+    else:
+        model = get_model(args.model, **model_kwargs)
+        pipeline = Pipeline([("preprocess", preprocessor), ("model", model)])
+        train_model(pipeline, train_df[feature_cols], train_df[LABEL_COL])
+        val_pred_proba = pipeline.predict_proba(val_df[feature_cols])[:, 1]
 
-    val_pred_proba = pipeline.predict_proba(val_df[feature_cols])[:, 1]
     metrics = evaluate(val_df[LABEL_COL], val_pred_proba)
     print_metrics(metrics)
 

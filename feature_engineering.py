@@ -175,6 +175,67 @@ def build_freq_agg_leaves_concat_pipeline(
     )
 
 
+DEFAULT_FREQ_SHRINK_M = 20.0
+DEFAULT_HIERARCHY_M = 20.0
+
+
+def build_hierarchy_parent_map(
+    train_df: pd.DataFrame,
+    cat_cols: list[str],
+    ohe: OneHotEncoder,
+    hierarchy_pairs: list[tuple[str, str]],
+) -> np.ndarray:
+    """Build a `(d,)` int array mapping each one-hot column index to its
+    "parent" column index for `_fit_fm_sgd`'s hierarchical back-off term, or
+    -1 for columns with no parent. `cat_cols`/`ohe.categories_` must be the
+    exact column list/order `ohe` was fit on (i.e. what was passed to
+    `build_ohe_only_pipeline`), since column offsets are derived by walking
+    them in lockstep.
+
+    For each `(child_col, parent_col)` pair, each child *value*'s parent is
+    its most frequent (mode) co-occurring parent value in `train_df` — not a
+    defensive fallback for a hypothetically-dirty edge case, but a load-
+    bearing choice: on the real Avazu sample, `site_domain -> site_category`
+    and `app_domain -> app_category` are NOT clean 1:1 mappings (up to ~92%
+    of rows touch an ambiguous domain), so `hierarchy_pairs` is expected to
+    contain only the pairs verified clean enough to trust (see
+    `consts.AD_HIERARCHY_PAIRS`), and the mode fallback handles the residual
+    noise in those pairs gracefully. Pairs whose child or parent column isn't
+    in `cat_cols` are skipped, so this degrades safely for a feature_set that
+    doesn't include the full hierarchy.
+
+    Only `train_df` is read — this is fit-on-train-only state, same pattern
+    as `fit_freq_agg_stats`.
+    """
+    offsets: dict[str, tuple[int, dict]] = {}
+    offset = 0
+    for col, categories in zip(cat_cols, ohe.categories_, strict=True):
+        offsets[col] = (offset, {val: offset + i for i, val in enumerate(categories)})
+        offset += len(categories)
+    d = offset
+
+    parent_idx = np.full(d, -1, dtype=np.int64)
+    for child_col, parent_col in hierarchy_pairs:
+        if child_col not in offsets or parent_col not in offsets:
+            continue
+        _child_offset, child_value_to_idx = offsets[child_col]
+        _parent_offset, parent_value_to_idx = offsets[parent_col]
+        # value_counts() drops NaN by default, so a child value whose every
+        # co-occurring parent value is NaN yields an empty Series here —
+        # idxmax() would raise on that rather than the "no reliable parent,
+        # leave as -1" behavior the rest of this function already gives
+        # unseen/unmapped values, so guard it explicitly instead of assuming
+        # every group has at least one non-null parent value.
+        mode_parent = train_df.groupby(child_col)[parent_col].agg(
+            lambda s: s.value_counts().idxmax() if not s.value_counts().empty else None
+        )
+        for child_val, parent_val in mode_parent.items():
+            if parent_val is None or child_val not in child_value_to_idx or parent_val not in parent_value_to_idx:
+                continue
+            parent_idx[child_value_to_idx[child_val]] = parent_value_to_idx[parent_val]
+    return parent_idx
+
+
 def _fm_forward(X: sp.csr_matrix, w0: float, w: np.ndarray, v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """The degree-2 FM forward pass — `z = w0 + Xw + interaction`, plus the
     per-row latent projection `s = Xv` (needed separately, alongside `z`,
@@ -229,6 +290,11 @@ def _fit_fm_sgd(
     sample_weight: np.ndarray | None = None,
     val_frac: float = 0.1,
     log_prefix: str = "FM",
+    freq_shrink_alpha: float = 0.0,
+    freq_shrink_m: float = DEFAULT_FREQ_SHRINK_M,
+    hierarchy_parent_idx: np.ndarray | None = None,
+    hierarchy_beta: float = 0.0,
+    hierarchy_m: float = DEFAULT_HIERARCHY_M,
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """Minibatch-SGD training loop shared by `FMEmbeddingEncoder` and
     `FMClassifier` — both fit the exact same degree-2 FM
@@ -296,6 +362,15 @@ def _fit_fm_sgd(
     again), and the function would return an effectively-random,
     silently-broken model instead of failing loudly at the point of
     divergence.
+
+    `freq_shrink_alpha`/`freq_shrink_m` (frequency-adaptive shrinkage) and
+    `hierarchy_parent_idx`/`hierarchy_beta`/`hierarchy_m` (hierarchical
+    back-off) are two independent, opt-in regularization extensions for
+    addressing undertrained embeddings of rare one-hot columns — both
+    default to disabled (`freq_shrink_alpha=0`, `hierarchy_parent_idx=None`
+    or `hierarchy_beta=0`), reducing exactly to today's uniform-`l2_reg`
+    update with no floating-point difference. See `build_hierarchy_parent_map`
+    for how `hierarchy_parent_idx` (a `(d,)` array, -1 = no parent) is built.
     """
     n, d = X.shape
     if X.data.size and not np.array_equal(np.unique(X.data), np.array([1.0])):
@@ -303,6 +378,19 @@ def _fit_fm_sgd(
             "_fit_fm_sgd requires binary (0/1) one-hot input — the x_i^2 = x_i identity "
             "the interaction term and its gradient rely on does not hold otherwise."
         )
+    if hierarchy_parent_idx is not None:
+        if hierarchy_parent_idx.shape != (d,):
+            raise ValueError(f"hierarchy_parent_idx must have shape ({d},), got {hierarchy_parent_idx.shape}")
+        valid = hierarchy_parent_idx == -1
+        valid |= (hierarchy_parent_idx >= 0) & (hierarchy_parent_idx < d)
+        if not valid.all():
+            raise ValueError("hierarchy_parent_idx entries must be -1 or a valid column index in [0, d)")
+        if hierarchy_beta > 0 and n_factors == 0:
+            raise ValueError(
+                "hierarchy_beta > 0 has no effect when n_factors=0 — the back-off term only "
+                "modifies v (shape (d, 0) here), never w. Not caught earlier so this fails "
+                "loudly here regardless of caller (trainer.py's CLI also rejects this combo)."
+            )
     rng = np.random.default_rng(random_state)
     sample_weight = np.ones(n, dtype=np.float64) if sample_weight is None else sample_weight
 
@@ -317,6 +405,15 @@ def _fit_fm_sgd(
     n_train = len(train_idx)
     if n_train == 0:
         raise ValueError(f"val_frac={val_frac} leaves no rows to train on (n_train=0) — reduce val_frac.")
+
+    # Per-column training-set activation counts, needed by both Technique A
+    # (frequency-adaptive shrinkage) and Technique B (hierarchical back-off)
+    # — computed once here, not per-batch. X is binary 0/1, so a column sum
+    # over rows is exactly that column's training activation count. Only
+    # computed from train_idx (never val_idx), matching the rest of this
+    # function's train-only fit-state discipline.
+    need_col_counts = freq_shrink_alpha > 0 or (hierarchy_parent_idx is not None and hierarchy_beta > 0)
+    col_counts = np.asarray(X[train_idx].sum(axis=0)).ravel() if need_col_counts else None
 
     w0 = 0.0
     w_ = np.zeros(d, dtype=np.float64)
@@ -362,9 +459,50 @@ def _fit_fm_sgd(
             # via the same x_i^2=x_i trick used inside _fm_forward.
             grad_v_active = (Xb_active.T @ (err[:, None] * s)) / denom - v_active * (g_active / denom)[:, None]
 
+            # Technique A: frequency-adaptive shrinkage — per-column L2
+            # strength scaled up for rarely-seen columns (rho -> 1 as
+            # col_counts -> 0), mirroring apply_freq_agg_stats' additive-
+            # smoothing formula but applied to shrinking embedding
+            # parameters toward zero rather than smoothing a target-encoded
+            # scalar. l2_eff_w/l2_eff_v stay the bare scalar l2_reg (no
+            # allocation, byte-identical to the pre-existing update) unless
+            # freq_shrink_alpha>0 — this is the disabled-by-default path, so
+            # every existing fm/sgd_logreg run pays no extra cost for a
+            # feature it never opts into. l2_eff_v is reshaped to
+            # (n_active, 1) only in the array case, since a scalar already
+            # broadcasts against v_active's (n_active, k) with no reshape.
+            l2_eff_w = l2_reg
+            l2_eff_v = l2_reg
+            if col_counts is not None and freq_shrink_alpha > 0:
+                rho_shrink = freq_shrink_m / (col_counts[active_cols] + freq_shrink_m)
+                l2_eff_w = l2_reg * (1.0 + freq_shrink_alpha * rho_shrink)
+                l2_eff_v = l2_eff_w[:, None]
+
+            # Technique B: hierarchical back-off — pulls a rare child
+            # column's v toward its (better-trained) parent's current v
+            # instead of toward zero, weighted by how little training data
+            # supports that specific child (same rarity-smoothing form as
+            # Technique A, its own independent hyperparameters). One-
+            # directional: no gradient flows back into the parent's own v
+            # row (v_ is read here, before this batch's in-place update
+            # below, so this is always a pre-update snapshot) — a rare
+            # child's noise can never perturb its well-trained parent.
+            # Stays the scalar 0.0 (no allocation) unless hierarchy_beta>0
+            # and at least one active column in this batch has a parent.
+            grad_hier_active = 0.0
+            if hierarchy_parent_idx is not None and hierarchy_beta > 0 and col_counts is not None:
+                parent_active = hierarchy_parent_idx[active_cols]
+                has_parent = parent_active != -1
+                if has_parent.any():
+                    grad_hier_active = np.zeros_like(v_active)
+                    rho_hier = hierarchy_m / (col_counts[active_cols][has_parent] + hierarchy_m)
+                    grad_hier_active[has_parent] = hierarchy_beta * rho_hier[:, None] * (
+                        v_active[has_parent] - v_[parent_active[has_parent]]
+                    )
+
             w0 -= learning_rate * (err.sum() / denom)
-            w_[active_cols] -= learning_rate * (g_active / denom + l2_reg * w_active)
-            v_[active_cols] -= learning_rate * (grad_v_active + l2_reg * v_active)
+            w_[active_cols] -= learning_rate * (g_active / denom + l2_eff_w * w_active)
+            v_[active_cols] -= learning_rate * (grad_v_active + l2_eff_v * v_active + grad_hier_active)
 
         if not epoch_losses:
             # Every batch this epoch had zero total sample weight (only
@@ -478,6 +616,11 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         early_stopping_tol: float = 1e-4,
         val_frac: float = 0.1,
         random_state: int | None = None,
+        freq_shrink_alpha: float = 0.0,
+        freq_shrink_m: float = DEFAULT_FREQ_SHRINK_M,
+        hierarchy_parent_idx: np.ndarray | None = None,
+        hierarchy_beta: float = 0.0,
+        hierarchy_m: float = DEFAULT_HIERARCHY_M,
     ):
         self.n_factors = n_factors
         self.n_epochs = n_epochs
@@ -488,6 +631,11 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         self.early_stopping_tol = early_stopping_tol
         self.val_frac = val_frac
         self.random_state = random_state
+        self.freq_shrink_alpha = freq_shrink_alpha
+        self.freq_shrink_m = freq_shrink_m
+        self.hierarchy_parent_idx = hierarchy_parent_idx
+        self.hierarchy_beta = hierarchy_beta
+        self.hierarchy_m = hierarchy_m
 
     def fit(self, X, y):
         X = sp.csr_matrix(X)
@@ -506,6 +654,11 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
             sample_weight=None,
             val_frac=self.val_frac,
             log_prefix="FMEmbeddingEncoder",
+            freq_shrink_alpha=self.freq_shrink_alpha,
+            freq_shrink_m=self.freq_shrink_m,
+            hierarchy_parent_idx=self.hierarchy_parent_idx,
+            hierarchy_beta=self.hierarchy_beta,
+            hierarchy_m=self.hierarchy_m,
         )
         return self
 
@@ -561,6 +714,11 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
         val_frac: float = 0.1,
         class_weight: str | dict | None = None,
         random_state: int | None = None,
+        freq_shrink_alpha: float = 0.0,
+        freq_shrink_m: float = DEFAULT_FREQ_SHRINK_M,
+        hierarchy_parent_idx: np.ndarray | None = None,
+        hierarchy_beta: float = 0.0,
+        hierarchy_m: float = DEFAULT_HIERARCHY_M,
     ):
         self.n_factors = n_factors
         self.n_epochs = n_epochs
@@ -572,6 +730,11 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
         self.val_frac = val_frac
         self.class_weight = class_weight
         self.random_state = random_state
+        self.freq_shrink_alpha = freq_shrink_alpha
+        self.freq_shrink_m = freq_shrink_m
+        self.hierarchy_parent_idx = hierarchy_parent_idx
+        self.hierarchy_beta = hierarchy_beta
+        self.hierarchy_m = hierarchy_m
 
     def fit(self, X, y):
         X = sp.csr_matrix(X)
@@ -599,6 +762,11 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
             sample_weight=sample_weight,
             val_frac=self.val_frac,
             log_prefix="FMClassifier",
+            freq_shrink_alpha=self.freq_shrink_alpha,
+            freq_shrink_m=self.freq_shrink_m,
+            hierarchy_parent_idx=self.hierarchy_parent_idx,
+            hierarchy_beta=self.hierarchy_beta,
+            hierarchy_m=self.hierarchy_m,
         )
         return self
 
