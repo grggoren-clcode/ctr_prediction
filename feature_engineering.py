@@ -193,6 +193,28 @@ def _fm_forward(X: sp.csr_matrix, w0: float, w: np.ndarray, v: np.ndarray) -> tu
     return z, s
 
 
+def _weighted_bce_loss(y: np.ndarray, p: np.ndarray, sample_weight: np.ndarray) -> float:
+    """Weighted mean binary cross-entropy — shared by `_fit_fm_sgd`'s
+    per-batch training loss and `_fm_eval_loss`'s held-out validation loss,
+    so training and evaluation can never silently compute loss differently.
+    """
+    p_clipped = np.clip(p, 1e-12, 1 - 1e-12)
+    return -np.sum(sample_weight * (y * np.log(p_clipped) + (1 - y) * np.log(1 - p_clipped))) / sample_weight.sum()
+
+
+def _fm_eval_loss(
+    X: sp.csr_matrix, y: np.ndarray, w0: float, w: np.ndarray, v: np.ndarray, sample_weight: np.ndarray
+) -> float:
+    """Weighted mean binary cross-entropy of the current FM weights on
+    `(X, y)` — a plain forward pass via `_fm_forward` (no gradient/active-
+    columns restriction needed, this never updates any parameter), used by
+    `_fit_fm_sgd` to score the held-out internal validation split each
+    epoch.
+    """
+    z, _s = _fm_forward(X, w0, w, v)
+    return _weighted_bce_loss(y, expit(z), sample_weight)
+
+
 def _fit_fm_sgd(
     X: sp.csr_matrix,
     y: np.ndarray,
@@ -205,6 +227,7 @@ def _fit_fm_sgd(
     early_stopping_tol: float,
     random_state: int | None,
     sample_weight: np.ndarray | None = None,
+    val_frac: float = 0.1,
     log_prefix: str = "FM",
 ) -> tuple[float, np.ndarray, np.ndarray]:
     """Minibatch-SGD training loop shared by `FMEmbeddingEncoder` and
@@ -213,30 +236,66 @@ def _fit_fm_sgd(
     in what they *do* with the result: `FMEmbeddingEncoder` keeps only `v`
     (as induced features for a downstream linear model), `FMClassifier`
     uses all three as its own prediction. Returns `(w0, w_, v_)` — the
-    weights from the **best** (lowest-loss) epoch seen during training, not
-    necessarily the last one (loss can wobble slightly upward near
-    convergence; without snapshotting, an unlucky final epoch would ship
-    strictly worse weights than an earlier one already reached).
+    weights from the **best** (lowest held-out-loss) epoch seen during
+    training, not necessarily the last one.
+
+    `val_frac` carves an internal validation split off of whatever `(X, y)`
+    this function is given, used ONLY to judge early stopping/which epoch's
+    weights to keep — never trained on. This is an internal, model-selection
+    split entirely local to this function; it has no relationship to the
+    project's outer time-based train/val split (`data_loader.time_based_split`)
+    beyond being a further subset of whatever fold was already labeled
+    "train" when it reaches here, so it doesn't touch or interact with
+    CLAUDE.md's no-leakage rule. It exists because training-loss-based
+    early stopping (this function's original design) judges "best" using
+    the same rows the model is fitting, which can keep "improving" well
+    past the point where it's still helping *held-out* performance —
+    confirmed directly: `FMClassifier`'s first version, selected by
+    training loss, shipped a val logloss of ~0.72 on the full 2M-row
+    sample, well above every other model in this project (~0.53-0.64).
+
+    The split is **chronological, not random**: the last `val_frac` fraction
+    of rows (by position in `X`) becomes the internal validation set, the
+    rest is trained on — mirroring `data_loader.time_based_split` exactly,
+    one level deeper. This relies on `X`'s row order still matching the
+    original chronological order `time_based_split` produced (nothing
+    between there and here — `add_hour_features`, `ColumnTransformer`/
+    `OneHotEncoder`, etc. — reorders rows, only transforms columns). A
+    *random* internal split would be the wrong comparison here: shuffling
+    minibatch order within a fixed training set doesn't change what the
+    model is being asked to generalize to, but shuffling which rows count
+    as "held out" would — it would estimate "generalizes to a random row
+    from the same time period as training" rather than "generalizes to the
+    future," letting e.g. a `device_id`/`device_ip` value shared between
+    the internal-train and internal-val split (because they're close in
+    time) give an optimistic read on how well the model handles identities
+    it will never see again in genuinely future data. Per-epoch minibatch
+    order is still shuffled (via `rng.permutation`) *within* the
+    chronological training portion — that's fine, since no row ever moves
+    across the train/val time boundary. `val_frac=0` (or too small an `X`
+    to carve any rows off, e.g. `int(n * val_frac) == 0`) disables the
+    internal split and falls back to judging by training loss instead — the
+    internal validation loss must have at least one row and a nonzero total
+    sample weight to be usable at all.
 
     `sample_weight`, if given, is a per-training-row weight (e.g. from
     `sklearn.utils.class_weight.compute_sample_weight`) folded into every
-    batch average/gradient in place of the plain row count. When
-    `sample_weight=None`, it's treated as all-ones (computed once here, not
-    reconstructed per batch), so every formula below collapses back to
-    exactly the unweighted arithmetic — this is what makes the refactor a
-    verified no-op for `FMEmbeddingEncoder`, which must stay behaviorally
-    identical. A batch whose sample weights happen to sum to exactly 0
-    (e.g. a custom `class_weight` dict assigning weight 0 to a class, and an
-    unlucky batch drawn entirely from that class) is skipped outright rather
-    than dividing by zero and poisoning the weights with NaN.
+    batch average/gradient (and the internal validation loss) in place of
+    the plain row count. When `sample_weight=None`, it's treated as
+    all-ones. A training batch whose sample weights happen to sum to
+    exactly 0 (e.g. a custom `class_weight` dict assigning weight 0 to a
+    class, and an unlucky batch drawn entirely from that class) is skipped
+    outright rather than dividing by zero and poisoning the weights with
+    NaN.
 
-    Raises `FloatingPointError` if the loss ever becomes non-finite (e.g.
-    `learning_rate` too high for this data) — silently continuing would
-    otherwise leave `best_w0_`/`best_w`/`best_v` pinned at their untrained
-    random-init values forever (`NaN < best_loss` is always `False`, so the
-    "new best" snapshot condition below can never fire again), and the
-    function would return an effectively-random, silently-broken model
-    instead of failing loudly at the point of divergence.
+    Raises `FloatingPointError` if the monitored loss ever becomes
+    non-finite (e.g. `learning_rate` too high for this data) — silently
+    continuing would otherwise leave `best_w0`/`best_w`/`best_v` pinned at
+    their untrained random-init values forever (`NaN < best_loss` is always
+    `False`, so the "new best" snapshot condition below can never fire
+    again), and the function would return an effectively-random,
+    silently-broken model instead of failing loudly at the point of
+    divergence.
     """
     n, d = X.shape
     if X.data.size and not np.array_equal(np.unique(X.data), np.array([1.0])):
@@ -247,6 +306,18 @@ def _fit_fm_sgd(
     rng = np.random.default_rng(random_state)
     sample_weight = np.ones(n, dtype=np.float64) if sample_weight is None else sample_weight
 
+    # Chronological split (last val_frac fraction of rows, by position) —
+    # see the docstring above for why this must not be a random split.
+    n_val = int(n * val_frac) if val_frac > 0 else 0
+    val_idx = np.arange(n - n_val, n)
+    train_idx = np.arange(0, n - n_val)
+    use_val = n_val > 0 and sample_weight[val_idx].sum() > 0
+    if use_val:
+        X_val, y_val, sw_val = X[val_idx], y[val_idx], sample_weight[val_idx]
+    n_train = len(train_idx)
+    if n_train == 0:
+        raise ValueError(f"val_frac={val_frac} leaves no rows to train on (n_train=0) — reduce val_frac.")
+
     w0 = 0.0
     w_ = np.zeros(d, dtype=np.float64)
     # Small random init (not zero) is required: with v=0, the latent
@@ -256,11 +327,11 @@ def _fit_fm_sgd(
     v_ = rng.normal(scale=0.01, size=(d, n_factors))
     best_w0, best_w, best_v = w0, w_.copy(), v_.copy()
 
-    n_batches = max(1, math.ceil(n / batch_size))
+    n_batches = max(1, math.ceil(n_train / batch_size))
     best_loss = np.inf
     epochs_without_improvement = 0
     for epoch in range(n_epochs):
-        order = rng.permutation(n)
+        order = train_idx[rng.permutation(n_train)]
         epoch_losses = []
         for batch_idx in np.array_split(order, n_batches):
             Xb = X[batch_idx]
@@ -282,8 +353,7 @@ def _fit_fm_sgd(
 
             z, s = _fm_forward(Xb_active, w0, w_active, v_active)
             p = expit(z)
-            p_clipped = np.clip(p, 1e-12, 1 - 1e-12)
-            batch_loss = -np.sum(swb * (yb * np.log(p_clipped) + (1 - yb) * np.log(1 - p_clipped))) / denom
+            batch_loss = _weighted_bce_loss(yb, p, swb)
             epoch_losses.append((batch_loss, denom))
 
             err = swb * (p - yb)  # (nb,) == weighted dL/dz for mean binary cross-entropy
@@ -309,26 +379,41 @@ def _fit_fm_sgd(
         # training itself (each batch's gradient step already uses that
         # batch's own correctly-normalized mean).
         losses, sizes = zip(*epoch_losses, strict=True)
-        weighted_loss = np.average(losses, weights=sizes)
-        print(f"[{log_prefix}] epoch {epoch + 1}/{n_epochs} mean logloss: {weighted_loss:.4f}")
-        if not np.isfinite(weighted_loss):
+        train_loss = np.average(losses, weights=sizes)
+
+        if use_val:
+            val_loss = _fm_eval_loss(X_val, y_val, w0, w_, v_, sw_val)
+            monitored_loss = val_loss
+            print(f"[{log_prefix}] epoch {epoch + 1}/{n_epochs} train logloss: {train_loss:.4f}  val logloss: {val_loss:.4f}")
+        else:
+            monitored_loss = train_loss
+            print(f"[{log_prefix}] epoch {epoch + 1}/{n_epochs} train logloss: {train_loss:.4f}")
+
+        # Check train_loss too, not just monitored_loss: with an internal
+        # val split, a divergent column that only appears in the training
+        # portion (e.g. a rare one-hot category absent from the
+        # chronologically-last val_frac slice) could blow up train_loss
+        # while leaving val_loss — computed on different rows — untouched,
+        # letting NaN-corrupted weights slip through the snapshot check
+        # below undetected.
+        if not np.isfinite(train_loss) or not np.isfinite(monitored_loss):
             raise FloatingPointError(
                 f"[{log_prefix}] training diverged (non-finite loss) at epoch {epoch + 1}/{n_epochs} — "
                 "try a lower learning_rate or higher l2_reg."
             )
 
-        # Plateau-based early stopping on training loss: guards against
-        # silently wasting compute (or, if a future n_epochs bump pushes
-        # well past convergence, overfitting) when nobody's watching the
-        # printed per-epoch loss. Judges "improvement" against the best
+        # Plateau-based early stopping: guards against silently wasting
+        # compute (or, if a future n_epochs bump pushes well past
+        # convergence, overfitting) when nobody's watching the printed
+        # per-epoch loss. Judges "improvement" against the best monitored
         # loss seen so far (not just the previous epoch), since the loss
         # can wobble slightly upward between epochs near convergence
         # without that meaning training has actually plateaued. Whenever a
         # new best is reached, snapshot the weights that achieved it — the
         # function returns this snapshot, not whatever epoch training
         # happens to end on.
-        if weighted_loss < best_loss - early_stopping_tol:
-            best_loss = weighted_loss
+        if monitored_loss < best_loss - early_stopping_tol:
+            best_loss = monitored_loss
             best_w0, best_w, best_v = w0, w_.copy(), v_.copy()
             epochs_without_improvement = 0
         else:
@@ -365,9 +450,12 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
     transformers do.
 
     `n_epochs` is an upper bound, not a target — `fit` stops early once the
-    (training-loss) plateau-detection in `early_stopping_patience`/
-    `early_stopping_tol` triggers, so raising `n_epochs` to explore whether
-    more training helps is safe by default rather than risking silent
+    plateau-detection in `early_stopping_patience`/`early_stopping_tol`
+    triggers, judged against an internal, chronologically-held-out `val_frac`
+    slice of the training data rather than training loss itself (see
+    `_fit_fm_sgd`'s docstring for why a time-based, not random, internal
+    split matters here) — so raising `n_epochs` to explore whether more
+    training helps is safe by default rather than risking silent
     overfitting on an unattended run.
 
     This class and `FMClassifier` intentionally duplicate the same SGD
@@ -388,6 +476,7 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         l2_reg: float = 1e-5,
         early_stopping_patience: int = 3,
         early_stopping_tol: float = 1e-4,
+        val_frac: float = 0.1,
         random_state: int | None = None,
     ):
         self.n_factors = n_factors
@@ -397,6 +486,7 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         self.l2_reg = l2_reg
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_tol = early_stopping_tol
+        self.val_frac = val_frac
         self.random_state = random_state
 
     def fit(self, X, y):
@@ -414,6 +504,7 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
             early_stopping_tol=self.early_stopping_tol,
             random_state=self.random_state,
             sample_weight=None,
+            val_frac=self.val_frac,
             log_prefix="FMEmbeddingEncoder",
         )
         return self
@@ -467,6 +558,7 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
         l2_reg: float = 1e-5,
         early_stopping_patience: int = 3,
         early_stopping_tol: float = 1e-4,
+        val_frac: float = 0.1,
         class_weight: str | dict | None = None,
         random_state: int | None = None,
     ):
@@ -477,6 +569,7 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
         self.l2_reg = l2_reg
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_tol = early_stopping_tol
+        self.val_frac = val_frac
         self.class_weight = class_weight
         self.random_state = random_state
 
@@ -504,6 +597,7 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
             early_stopping_tol=self.early_stopping_tol,
             random_state=self.random_state,
             sample_weight=sample_weight,
+            val_frac=self.val_frac,
             log_prefix="FMClassifier",
         )
         return self
