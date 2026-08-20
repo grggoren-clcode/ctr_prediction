@@ -61,13 +61,20 @@ fraction of the sample), `--data-path` (override the raw data location).
   user/ad columns. Pairs with any `--model`.
 - **`--feature-set baseline_ohe`**: every raw categorical column (including
   `device_id`/`device_ip`/`site_id`/`app_id`) one-hot encoded, uncapped, sparse —
-  a naive baseline with no target-encoding. Intended for `--model logreg` or
-  `--model fm` (sparse input; `hist_gbdt` needs dense and this matrix is too wide
-  to densify). `--model fm` trains `feature_engineering.FMClassifier` — a
-  standalone, jointly-optimized degree-2 Factorization Machine (`ŷ(x) = w0 +
-  Σwᵢxᵢ + Σ⟨vᵢ,vⱼ⟩xᵢxⱼ`) used directly as the classifier, as opposed to
-  `gbdt_leaves_ohe`-style techniques where an internal model's output only
-  ever feeds a separately-trained linear model.
+  a naive baseline with no target-encoding. Intended for `--model logreg`,
+  `--model fm`, or `--model sgd_logreg` (sparse input; `hist_gbdt` needs dense
+  and this matrix is too wide to densify). `--model fm` trains
+  `feature_engineering.FMClassifier` — a standalone, jointly-optimized degree-2
+  Factorization Machine (`ŷ(x) = w0 + Σwᵢxᵢ + Σ⟨vᵢ,vⱼ⟩xᵢxⱼ`) used directly as
+  the classifier, as opposed to `gbdt_leaves_ohe`-style techniques where an
+  internal model's output only ever feeds a separately-trained linear model.
+  `--model sgd_logreg` is the same `FMClassifier` with `n_factors=0` (the
+  pairwise term structurally vanishes), i.e. plain first-order logistic
+  regression trained via this project's own SGD loop instead of sklearn's
+  L-BFGS — added specifically so it's directly comparable to `fm` with no
+  hyperparameter confound, after a diagnostic found most of `fm`'s gap versus
+  `--model logreg` traced back to optimizer quality rather than the pairwise
+  term itself (see `FM_CLASSIFIER_PARAMS`/`SGD_LOGREG_PARAMS` in `consts.py`).
 - **`--feature-set gbdt_leaves`**: the Facebook GBDT+LR technique — a lightgbm
   GBDT trains on the raw categorical + hour columns (via lightgbm's native
   categorical handling), then each row is re-encoded as the one-hot

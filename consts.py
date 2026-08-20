@@ -61,15 +61,10 @@ GBDT_LEAF_ENCODER_PARAMS = {
 }
 
 # Defaults for feature_engineering.FMEmbeddingEncoder (the `freq_agg_fm_concat`
-# feature set's internal Factorization Machine) AND feature_engineering.FMClassifier
-# (the standalone `--model fm` classifier, used with `--feature-set baseline_ohe` —
-# see trainer.get_model). n_factors is the latent embedding dimension — kept
-# modest (16) since for FMEmbeddingEncoder these become concatenated input
-# features for a downstream LR, not the final prediction; FMClassifier reuses
-# the same value as a starting point despite training as the final classifier
-# itself, a different role that may warrant its own separate tuning pass later.
-# random_state is deliberately excluded — trainer.py merges in args.seed at
-# construction time, same as GBDT_LEAF_ENCODER_PARAMS above.
+# feature set's internal Factorization Machine, used as a feature-inducer for
+# a downstream LR — NOT the final prediction itself). random_state is
+# deliberately excluded — trainer.py merges in args.seed at construction
+# time, same as GBDT_LEAF_ENCODER_PARAMS above.
 #
 # Tuned up from an initial 8-factor/5-epoch/lr=0.05 pass, which undershot —
 # the printed per-epoch logloss was still dropping at epoch 5, meaning SGD
@@ -86,10 +81,57 @@ GBDT_LEAF_ENCODER_PARAMS = {
 # n_epochs is only an upper bound in any case — FMEmbeddingEncoder.fit now
 # stops early once its plateau-detection (early_stopping_patience/_tol)
 # triggers, so this doesn't need to be retuned precisely.
+#
+# NOT used by FMClassifier ("fm"/"sgd_logreg" --model choices) — those have
+# their own separately-tuned FM_CLASSIFIER_PARAMS/SGD_LOGREG_PARAMS below,
+# since a standalone classifier's own predictive accuracy is a different
+# optimization target than "produces good induced features for a downstream
+# LR", and empirically needs different hyperparameters (much smaller
+# batch_size in particular — see the comment below).
 FM_ENCODER_PARAMS = {
     "n_factors": 16,
     "n_epochs": 30,
     "batch_size": 4096,
     "learning_rate": 0.15,
+    "l2_reg": 1e-5,
+}
+
+# Defaults for feature_engineering.FMClassifier used as the standalone `fm`
+# --model (full degree-2 FM: first-order + pairwise interaction, jointly
+# trained) and, with n_factors forced to 0 in trainer.get_model, the
+# `sgd_logreg` --model (first-order only — i.e. plain logistic regression,
+# but trained via this project's own SGD loop instead of sklearn's L-BFGS,
+# added specifically so it's directly comparable to "fm" with no
+# hyperparameter confound between them).
+#
+# A /btw diagnostic found FM_ENCODER_PARAMS' batch_size=4096 (tuned for a
+# different role, see above) was badly mismatched for training a standalone
+# classifier: a staged hyperparameter sweep on a 100K-row sample (measuring
+# real held-out AUC/logloss, not internal training loss) found smaller
+# batch_size to be the single highest-leverage knob for both models — AUC
+# improved substantially and monotonically as batch_size shrank from 4096
+# down to roughly 128-512, before returns diminished/became noisy at the
+# small-sample scale tested. Higher learning_rate also helped once batch_size
+# was small enough to keep gradient steps well-behaved; l2_reg had almost no
+# effect anywhere in the range tested (1e-6 to 1e-3) and is left at
+# FM_ENCODER_PARAMS' existing value. Confirmed stable across 3 random seeds
+# before promoting to these defaults.
+#
+# fm's batch_size (512) is deliberately larger than sgd_logreg's (128): the
+# same sweep found fm diverges (non-finite loss) at batch_size=128 combined
+# with a high learning_rate — the pairwise interaction term amplifies
+# per-batch gradient noise quadratically (through v), so smaller batches
+# destabilize it well before they destabilize the linear-only sgd_logreg.
+FM_CLASSIFIER_PARAMS = {
+    "n_factors": 16,
+    "n_epochs": 60,
+    "batch_size": 512,
+    "learning_rate": 0.4,
+    "l2_reg": 1e-5,
+}
+SGD_LOGREG_PARAMS = {
+    "n_epochs": 60,
+    "batch_size": 128,
+    "learning_rate": 0.2,
     "l2_reg": 1e-5,
 }

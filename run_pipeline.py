@@ -1,7 +1,7 @@
 """One-command end-to-end run: load -> time-split -> engineer features -> train -> evaluate.
 
-Trains `logreg`/`hist_gbdt` on the `freq_agg` feature set, `logreg`/`fm` on the
-naive `baseline_ohe` feature set, and `logreg` on the GBDT-leaf-embedding
+Trains `logreg`/`hist_gbdt` on the `freq_agg` feature set, `logreg`/`fm`/`sgd_logreg`
+on the naive `baseline_ohe` feature set, and `logreg` on the GBDT-leaf-embedding
 `gbdt_leaves`/`gbdt_leaves_ohe`/`gbdt_leaves_concat`/`freq_agg_leaves_concat`
 and FM-embedding `freq_agg_fm_concat` feature sets (see trainer.py), all on
 the same sample/split, and prints a comparison table. This is the scaffold's
@@ -31,14 +31,15 @@ from trainer import (
 # infeasible (enforced by trainer.check_feature_set_model_compatible below —
 # see FEATURE_SET_COMPATIBLE_MODELS there for exactly which feature_sets are
 # dense vs. sparse; freq_agg_fm_concat, despite its GBDT-leaf-shaped
-# structure, actually is fully dense). "fm" (FMClassifier) is likewise only
-# paired with baseline_ohe: its training/prediction math relies on
-# x_i^2 = x_i, which only holds for pure one-hot columns.
+# structure, actually is fully dense). "fm"/"sgd_logreg" (both FMClassifier)
+# are likewise only paired with baseline_ohe: their training/prediction math
+# relies on x_i^2 = x_i, which only holds for pure one-hot columns.
 RUNS = [
     ("logreg", "freq_agg"),
     ("hist_gbdt", "freq_agg"),
     ("logreg", "baseline_ohe"),
     ("fm", "baseline_ohe"),
+    ("sgd_logreg", "baseline_ohe"),
     ("logreg", "gbdt_leaves"),
     ("logreg", "gbdt_leaves_ohe"),
     ("logreg", "gbdt_leaves_concat"),
