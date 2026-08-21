@@ -16,10 +16,28 @@ from consts import HOUR_COL, LABEL_COL
 def build_preprocessing_pipeline(
     cat_cols: list[str], num_cols: list[str], max_categories: int = 50
 ) -> ColumnTransformer:
-    # max_categories caps cardinality on the anonymized high-cardinality context
-    # columns (C14-C21 etc.) so one-hot encoding stays a manageable size. Dense
-    # output (sparse_output=False) because HistGradientBoostingClassifier in the
-    # installed scikit-learn version requires dense X.
+    """Capped one-hot + standard-scaling preprocessor for the `freq_agg` feature set.
+
+    max_categories caps cardinality on the anonymized high-cardinality context
+    columns (C14-C21 etc.) so one-hot encoding stays a manageable size. Dense
+    output (sparse_output=False) because HistGradientBoostingClassifier in the
+    installed scikit-learn version requires dense X.
+
+    Args:
+        cat_cols: List of categorical column names to one-hot encode; each is
+            a 1D column of shape `(n,)` in the input DataFrame.
+        num_cols: List of numeric column names to standardize (zero mean,
+            unit variance, fit on train only).
+        max_categories: Cap (scalar int) on distinct categories kept per
+            column in `cat_cols` — extras collapse into an "infrequent"
+            bucket.
+
+    Returns:
+        An unfitted `ColumnTransformer`; once fit+transformed on a DataFrame
+        of shape `(n_rows, len(cat_cols) + len(num_cols))`, produces a dense
+        `np.ndarray` of shape `(n_rows, d)` where `d = sum(min(cardinality_i,
+        max_categories) for i in cat_cols) + len(num_cols)`.
+    """
     return ColumnTransformer(
         transformers=[
             (
@@ -42,6 +60,19 @@ def build_ohe_only_pipeline(cat_cols: list[str]) -> ColumnTransformer:
     handle_unknown="ignore" is expected to produce many all-zero blocks in val
     for the highest-cardinality columns under a time-based split — a known
     limitation of this baseline, not a leakage issue.
+
+    Args:
+        cat_cols: List of categorical column names to one-hot encode,
+            uncapped — every distinct training-set value gets its own
+            column; each is a 1D column of shape `(n,)` in the input
+            DataFrame.
+
+    Returns:
+        An unfitted `ColumnTransformer`; once fit+transformed on a DataFrame
+        of shape `(n_rows, len(cat_cols))`, produces a sparse
+        `scipy.sparse.csr_matrix` of shape `(n_rows, d)` where
+        `d = sum(cardinality_i for i in cat_cols)` (cardinalities as seen in
+        the fit data).
     """
     return ColumnTransformer(
         transformers=[("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=True), cat_cols)],
@@ -57,6 +88,20 @@ def to_lgbm_categoricals(
     `train_df` only (per CLAUDE.md's no-leakage rule) — values in `val_df`
     that never appeared in train become NaN, which lightgbm treats as
     missing rather than raising.
+
+    Args:
+        train_df: Training DataFrame, shape `(n_train, n_cols)` — the
+            category vocabulary for each entry of `cat_cols` is derived from
+            this DataFrame only.
+        val_df: Validation DataFrame, shape `(n_val, n_cols)`, same schema
+            as `train_df`.
+        cat_cols: List of column names to cast to pandas 'category' dtype.
+
+    Returns:
+        `(train_df, val_df)` — same shapes as the inputs, with each column
+        in `cat_cols` now 'category'-dtyped (fixed vocabulary from
+        `train_df`; values in `val_df` absent from that vocabulary become
+        `NaN`).
     """
     train_df = train_df.copy()
     val_df = val_df.copy()
@@ -83,9 +128,28 @@ class GBDTLeafEncoder(BaseEstimator, TransformerMixin):
     """
 
     def __init__(self, gbdt_params: dict | None = None):
+        """
+        Args:
+            gbdt_params: dict of keyword arguments forwarded to
+                `lightgbm.LGBMClassifier`'s constructor (e.g.
+                `{"n_estimators": 100, "num_leaves": 31, ...}`), or `None`
+                for lightgbm's own defaults.
+        """
         self.gbdt_params = gbdt_params
 
     def fit(self, X, y):
+        """Fit the internal GBDT on `(X, y)`, then fit a leaf-index one-hot encoder.
+
+        Args:
+            X: Training feature matrix for the internal GBDT, shape
+                `(n, d_in)` — any format `lightgbm.LGBMClassifier.fit`
+                accepts (dense array, sparse matrix, or a DataFrame with
+                'category'-dtype columns).
+            y: Training labels, shape `(n,)`, binary 0/1.
+
+        Returns:
+            self, fitted (sets `self.gbdt_` and `self.ohe_`).
+        """
         import lightgbm as lgb
 
         self.gbdt_ = lgb.LGBMClassifier(**(self.gbdt_params or {}))
@@ -96,6 +160,18 @@ class GBDTLeafEncoder(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
+        """Re-encode `X` as the one-hot concatenation of which leaf each row lands in, per tree.
+
+        Args:
+            X: Feature matrix in the same format/columns as `fit`'s `X`,
+                shape `(n, d_in)`.
+
+        Returns:
+            Sparse `csr_matrix` of shape `(n, d_leaf)`, where `d_leaf` is the
+            total number of distinct (tree, leaf_index) pairs seen at fit
+            time (at most `gbdt_.n_estimators_ * num_leaves`, one active
+            column per row per tree).
+        """
         leaves = self.gbdt_.predict(X, pred_leaf=True)
         return self.ohe_.transform(leaves)
 
@@ -108,6 +184,17 @@ def build_gbdt_leaves_ohe_pipeline(cat_cols: list[str], gbdt_params: dict | None
     max_bin cap on high-cardinality categoricals (device_id/device_ip etc.
     silently lose resolution under native handling — see gbdt_leaves'
     training warning) at the cost of a much wider, sparser GBDT input.
+
+    Args:
+        cat_cols: List of categorical column names one-hot encoded before
+            being fed to the internal GBDT.
+        gbdt_params: dict forwarded to `GBDTLeafEncoder`'s internal
+            `LGBMClassifier`.
+
+    Returns:
+        An unfitted `Pipeline`; once fit+transformed on a DataFrame of shape
+        `(n_rows, len(cat_cols))`, produces a sparse `csr_matrix` of shape
+        `(n_rows, d_leaf)` (see `GBDTLeafEncoder.transform`).
     """
     return Pipeline(
         [
@@ -129,6 +216,20 @@ def build_gbdt_leaves_concat_pipeline(cat_cols: list[str], gbdt_params: dict | N
     the same cat_cols independently (FeatureUnion doesn't share fitted state
     across branches) — a small duplicated cost, cheap relative to the GBDT/LR
     fits themselves.
+
+    Args:
+        cat_cols: List of categorical column names, used both for the raw
+            one-hot branch and (independently, via its own OneHotEncoder)
+            the internal GBDT's one-hot input.
+        gbdt_params: dict forwarded to the internal `GBDTLeafEncoder`.
+
+    Returns:
+        An unfitted `FeatureUnion`; once fit+transformed on a DataFrame of
+        shape `(n_rows, len(cat_cols))`, produces a sparse `csr_matrix` of
+        shape `(n_rows, d_ohe + d_leaf)` — horizontal concatenation of the
+        raw one-hot block (`d_ohe` columns, see `build_ohe_only_pipeline`)
+        and the GBDT-leaf block (`d_leaf` columns, see
+        `GBDTLeafEncoder.transform`).
     """
     return FeatureUnion(
         [
@@ -166,6 +267,24 @@ def build_freq_agg_leaves_concat_pipeline(
     GBDT on plain one-hot instead avoids this entirely, since raw category
     indicators carry no target-derived/self-referential information — this
     is exactly the same GBDT `gbdt_leaves_ohe` already trains and validates.
+
+    Args:
+        freq_cat_cols: Capped categorical column names for the freq_agg
+            branch (`build_preprocessing_pipeline`'s `cat_cols`).
+        freq_num_cols: Numeric column names (the freq_agg `_ctr`/`_count`
+            plus `hour_of_day`/`day_of_week` columns) for the freq_agg
+            branch.
+        gbdt_cat_cols: Raw, uncapped categorical column names fed to the
+            internal leaf-inducing GBDT — deliberately NOT freq_agg's own
+            `_ctr`/`_count` columns (see rationale above).
+        gbdt_params: dict forwarded to the internal `GBDTLeafEncoder`.
+
+    Returns:
+        An unfitted `FeatureUnion`; once fit+transformed, produces a matrix
+        of shape `(n_rows, d_freq + d_leaf)` — horizontal concatenation of
+        freq_agg's dense block (`d_freq` columns, see
+        `build_preprocessing_pipeline`) and the GBDT-leaf block (`d_leaf`
+        columns, see `GBDTLeafEncoder.transform`).
     """
     return FeatureUnion(
         [
@@ -206,6 +325,23 @@ def build_hierarchy_parent_map(
 
     Only `train_df` is read — this is fit-on-train-only state, same pattern
     as `fit_freq_agg_stats`.
+
+    Args:
+        train_df: Training DataFrame, shape `(n_train, n_cols)` — must
+            contain every column referenced in `hierarchy_pairs`.
+        cat_cols: List of column names, in the exact order `ohe` was fit
+            on; `len(cat_cols)` must equal `len(ohe.categories_)`.
+        ohe: A fitted `sklearn.preprocessing.OneHotEncoder`. `ohe.categories_`
+            is a list of 1D arrays, one per `cat_cols` entry, where
+            `categories_[i]` has length equal to that column's cardinality.
+        hierarchy_pairs: List of `(child_col, parent_col)` name tuples.
+
+    Returns:
+        `parent_idx`, a 1D `np.ndarray` of shape `(d,)` (int64) where
+        `d = sum(len(c) for c in ohe.categories_)` is the total one-hot
+        width — `parent_idx[i]` is the global one-hot column index of column
+        `i`'s parent, or `-1` if column `i` has no parent (not part of any
+        pair, or its mode-parent value couldn't be resolved).
     """
     offsets: dict[str, tuple[int, dict]] = {}
     offset = 0
@@ -246,6 +382,21 @@ def _fm_forward(X: sp.csr_matrix, w0: float, w: np.ndarray, v: np.ndarray) -> tu
     `FMClassifier.predict_proba` so the two can never drift out of sync —
     the same forward pass must produce the same score whether it's being
     evaluated during training or at inference time.
+
+    Args:
+        X: One-hot input matrix, shape `(n, d)` — sparse `csr_matrix`, must
+            be binary 0/1 (the `x_i^2 = x_i` identity this function relies
+            on requires it).
+        w0: Scalar bias term (Python float).
+        w: First-order weights, shape `(d,)`.
+        v: Latent factor matrix, shape `(d, k)` where `k = n_factors` — one
+            length-`k` embedding row per one-hot column.
+
+    Returns:
+        `(z, s)` — `z`: shape `(n,)`, the FM logit per row
+        (`w0 + Xw + interaction`); `s`: shape `(n, k)`, each row's summed
+        latent projection `Xv` (returned alongside `z` since the caller's
+        gradient computation needs it too).
     """
     s = X @ v  # (n, k): sum of active categories' latent vectors
     sq_sum = X @ (v**2)  # (n, k): x_i^2 == x_i for binary one-hot input
@@ -258,6 +409,16 @@ def _weighted_bce_loss(y: np.ndarray, p: np.ndarray, sample_weight: np.ndarray) 
     """Weighted mean binary cross-entropy — shared by `_fit_fm_sgd`'s
     per-batch training loss and `_fm_eval_loss`'s held-out validation loss,
     so training and evaluation can never silently compute loss differently.
+
+    Args:
+        y: True binary labels, shape `(n,)`, values in `{0.0, 1.0}`.
+        p: Predicted probabilities, shape `(n,)`, in `(0, 1)` (clipped
+            internally to `[1e-12, 1 - 1e-12]` to avoid `log(0)`).
+        sample_weight: Per-row weights, shape `(n,)`, nonnegative floats.
+
+    Returns:
+        Scalar float — the `sample_weight`-weighted mean binary
+        cross-entropy.
     """
     p_clipped = np.clip(p, 1e-12, 1 - 1e-12)
     return -np.sum(sample_weight * (y * np.log(p_clipped) + (1 - y) * np.log(1 - p_clipped))) / sample_weight.sum()
@@ -271,6 +432,17 @@ def _fm_eval_loss(
     columns restriction needed, this never updates any parameter), used by
     `_fit_fm_sgd` to score the held-out internal validation split each
     epoch.
+
+    Args:
+        X: One-hot input matrix, shape `(n, d)`.
+        y: True binary labels, shape `(n,)`.
+        w0: Scalar bias term.
+        w: First-order weights, shape `(d,)`.
+        v: Latent factor matrix, shape `(d, k)`.
+        sample_weight: Per-row weights, shape `(n,)`.
+
+    Returns:
+        Scalar float loss (weighted mean binary cross-entropy).
     """
     z, _s = _fm_forward(X, w0, w, v)
     return _weighted_bce_loss(y, expit(z), sample_weight)
@@ -371,6 +543,48 @@ def _fit_fm_sgd(
     or `hierarchy_beta=0`), reducing exactly to today's uniform-`l2_reg`
     update with no floating-point difference. See `build_hierarchy_parent_map`
     for how `hierarchy_parent_idx` (a `(d,)` array, -1 = no parent) is built.
+
+    Args:
+        X: One-hot input matrix, shape `(n, d)` — sparse `csr_matrix`,
+            binary 0/1 (enforced by an internal check).
+        y: Training labels, shape `(n,)`, values in `{0.0, 1.0}`.
+        n_factors: Scalar int — the latent dimension `k` of `v` (`0`
+            structurally disables the pairwise interaction term).
+        n_epochs: Scalar int — upper bound on training epochs (early
+            stopping usually halts sooner).
+        batch_size: Scalar int — target number of rows per minibatch.
+        learning_rate: Scalar float — SGD step size.
+        l2_reg: Scalar float — base uniform L2 penalty applied to `w` and
+            `v` every step.
+        early_stopping_patience: Scalar int — epochs without improvement
+            (beyond `early_stopping_tol`) tolerated before stopping.
+        early_stopping_tol: Scalar float — minimum loss decrease counted as
+            "improvement".
+        random_state: Scalar int or `None` — seed for weight init and
+            per-epoch minibatch shuffling.
+        sample_weight: Per-row weights, shape `(n,)`, or `None` (treated as
+            all-ones).
+        val_frac: Scalar float in `[0, 1]` — fraction of `X`'s rows (the
+            chronologically last slice, by position) carved off as the
+            internal early-stopping validation split.
+        log_prefix: str prepended to each printed per-epoch log line.
+        freq_shrink_alpha: Scalar float — frequency-adaptive shrinkage
+            strength (`0` disables Technique A).
+        freq_shrink_m: Scalar float — pseudo-count smoothing constant for
+            Technique A.
+        hierarchy_parent_idx: `(d,)` int array (or `None`) mapping each
+            column index to its parent column index, `-1` = no parent (see
+            `build_hierarchy_parent_map`).
+        hierarchy_beta: Scalar float — hierarchical back-off strength (`0`
+            or `hierarchy_parent_idx=None` disables Technique B).
+        hierarchy_m: Scalar float — pseudo-count smoothing constant for
+            Technique B.
+
+    Returns:
+        `(best_w0, best_w, best_v)` — the weights from the best (lowest
+        held-out-loss, or lowest train-loss if `val_frac` disables the
+        internal split) epoch: `best_w0` a scalar float, `best_w` shape
+        `(d,)`, `best_v` shape `(d, n_factors)`.
     """
     n, d = X.shape
     if X.data.size and not np.array_equal(np.unique(X.data), np.array([1.0])):
@@ -622,6 +836,34 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         hierarchy_beta: float = 0.0,
         hierarchy_m: float = DEFAULT_HIERARCHY_M,
     ):
+        """
+        Args:
+            n_factors: Scalar int — latent dimension `k`; `self.v_` will
+                have shape `(d, k)` after fitting.
+            n_epochs: Scalar int — upper bound on training epochs.
+            batch_size: Scalar int — target rows per SGD minibatch.
+            learning_rate: Scalar float — SGD step size.
+            l2_reg: Scalar float — base uniform L2 penalty.
+            early_stopping_patience: Scalar int — epochs without
+                improvement tolerated before stopping.
+            early_stopping_tol: Scalar float — minimum loss decrease
+                counted as improvement.
+            val_frac: Scalar float in `[0, 1]` — fraction of training rows
+                (chronologically last) held out internally for early
+                stopping (see `_fit_fm_sgd`).
+            random_state: Scalar int or `None` — seed for weight init and
+                minibatch shuffling.
+            freq_shrink_alpha: Scalar float — frequency-adaptive shrinkage
+                strength (`0` disables).
+            freq_shrink_m: Scalar float — pseudo-count smoothing constant
+                for shrinkage.
+            hierarchy_parent_idx: `(d,)` int array or `None` — see
+                `build_hierarchy_parent_map`.
+            hierarchy_beta: Scalar float — hierarchical back-off strength
+                (`0` disables).
+            hierarchy_m: Scalar float — pseudo-count smoothing constant for
+                back-off.
+        """
         self.n_factors = n_factors
         self.n_epochs = n_epochs
         self.batch_size = batch_size
@@ -638,6 +880,17 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         self.hierarchy_m = hierarchy_m
 
     def fit(self, X, y):
+        """Fit the FM via `_fit_fm_sgd` and keep only `w0_`/`w_`/`v_`.
+
+        Args:
+            X: One-hot input matrix, shape `(n, d)` — coerced to
+                `csr_matrix` internally.
+            y: Labels, shape `(n,)`.
+
+        Returns:
+            self, fitted — sets `self.w0_` (scalar), `self.w_` (shape
+            `(d,)`), `self.v_` (shape `(d, n_factors)`).
+        """
         X = sp.csr_matrix(X)
         y = np.asarray(y, dtype=np.float64)
         self.w0_, self.w_, self.v_ = _fit_fm_sgd(
@@ -663,6 +916,16 @@ class FMEmbeddingEncoder(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
+        """Project `X` onto the fitted latent factors.
+
+        Args:
+            X: One-hot input matrix, shape `(n, d)`, matching the `d` used
+                at fit time.
+
+        Returns:
+            Dense `np.ndarray` (or matrix, per `X @ v_`'s dtype), shape
+            `(n, n_factors)` — `X @ self.v_`.
+        """
         X = sp.csr_matrix(X)
         return X @ self.v_
 
@@ -720,6 +983,37 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
         hierarchy_beta: float = 0.0,
         hierarchy_m: float = DEFAULT_HIERARCHY_M,
     ):
+        """
+        Args:
+            n_factors: Scalar int — latent dimension `k`; `self.v_` will
+                have shape `(d, k)` after fitting.
+            n_epochs: Scalar int — upper bound on training epochs.
+            batch_size: Scalar int — target rows per SGD minibatch.
+            learning_rate: Scalar float — SGD step size.
+            l2_reg: Scalar float — base uniform L2 penalty.
+            early_stopping_patience: Scalar int — epochs without
+                improvement tolerated before stopping.
+            early_stopping_tol: Scalar float — minimum loss decrease
+                counted as improvement.
+            val_frac: Scalar float in `[0, 1]` — fraction of training rows
+                (chronologically last) held out internally for early
+                stopping (see `_fit_fm_sgd`).
+            class_weight: `"balanced"`, a `{class_label: weight}` dict, or
+                `None` — mirrors `sklearn.linear_model.LogisticRegression`'s
+                parameter of the same name.
+            random_state: Scalar int or `None` — seed for weight init and
+                minibatch shuffling.
+            freq_shrink_alpha: Scalar float — frequency-adaptive shrinkage
+                strength (`0` disables).
+            freq_shrink_m: Scalar float — pseudo-count smoothing constant
+                for shrinkage.
+            hierarchy_parent_idx: `(d,)` int array or `None` — see
+                `build_hierarchy_parent_map`.
+            hierarchy_beta: Scalar float — hierarchical back-off strength
+                (`0` disables; also requires `n_factors > 0`).
+            hierarchy_m: Scalar float — pseudo-count smoothing constant for
+                back-off.
+        """
         self.n_factors = n_factors
         self.n_epochs = n_epochs
         self.batch_size = batch_size
@@ -737,6 +1031,19 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
         self.hierarchy_m = hierarchy_m
 
     def fit(self, X, y):
+        """Fit the FM end-to-end via `_fit_fm_sgd`, keeping `w0_`/`w_`/`v_` as this classifier's own weights.
+
+        Args:
+            X: One-hot input matrix, shape `(n, d)` — coerced to
+                `csr_matrix` internally.
+            y: Labels, shape `(n,)` — any two distinct values (mapped
+                internally to canonical `{0, 1}` via `classes_`).
+
+        Returns:
+            self, fitted — sets `self.classes_` (shape `(2,)`), `self.w0_`
+            (scalar), `self.w_` (shape `(d,)`), `self.v_` (shape
+            `(d, n_factors)`).
+        """
         X = sp.csr_matrix(X)
         y_arr = np.asarray(y)
         self.classes_ = np.unique(y_arr)
@@ -771,12 +1078,32 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
         return self
 
     def predict_proba(self, X):
+        """Compute the FM's predicted class probabilities.
+
+        Args:
+            X: One-hot input matrix, shape `(n, d)`, matching the `d` used
+                at fit time.
+
+        Returns:
+            `np.ndarray` of shape `(n, 2)` — column 0 is `P(classes_[0])`,
+            column 1 is `P(classes_[1])` (`= expit(z)`, `z` from
+            `_fm_forward`).
+        """
         X = sp.csr_matrix(X)
         z, _s = _fm_forward(X, self.w0_, self.w_, self.v_)
         p = expit(z)
         return np.column_stack([1 - p, p])
 
     def predict(self, X):
+        """Compute the FM's predicted class labels via a 0.5 threshold on `predict_proba`.
+
+        Args:
+            X: One-hot input matrix, shape `(n, d)`.
+
+        Returns:
+            `np.ndarray` of shape `(n,)` — predicted label per row, drawn
+            from `self.classes_`.
+        """
         idx = (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
         return self.classes_[idx]
 
@@ -786,6 +1113,15 @@ def build_fm_embed_pipeline(cat_cols: list[str], fm_params: dict | None = None) 
     shape: the FM trains on raw uncapped one-hot vectors (same columns as
     `baseline_ohe`), and each row's latent projection is exposed as induced
     features. Reused by `build_freq_agg_fm_concat_pipeline` below.
+
+    Args:
+        cat_cols: List of categorical column names to one-hot encode before
+            the FM.
+        fm_params: dict forwarded to `FMEmbeddingEncoder`'s constructor.
+
+    Returns:
+        An unfitted `Pipeline`; once fit+transformed, produces a dense
+        matrix of shape `(n_rows, n_factors)`.
     """
     return Pipeline(
         [
@@ -810,6 +1146,18 @@ def build_freq_agg_fm_concat_pipeline(
     the same reason: those columns carry a small train-only leave-one-out
     artifact that a flexible second model can exploit, so the induced-feature
     model should train on plain one-hot instead.
+
+    Args:
+        freq_cat_cols: Capped categorical column names for the freq_agg
+            branch.
+        freq_num_cols: Numeric column names for the freq_agg branch.
+        fm_cat_cols: Raw categorical columns fed to the FM branch.
+        fm_params: dict forwarded to `FMEmbeddingEncoder` (via
+            `build_fm_embed_pipeline`).
+
+    Returns:
+        An unfitted `FeatureUnion`; once fit+transformed, produces a dense
+        matrix of shape `(n_rows, d_freq + n_factors)`.
     """
     return FeatureUnion(
         [
@@ -820,7 +1168,17 @@ def build_freq_agg_fm_concat_pipeline(
 
 
 def add_hour_features(df: pd.DataFrame, hour_col: str = HOUR_COL) -> pd.DataFrame:
-    """Parse Avazu's YYMMDDHH `hour` column into `hour_of_day` and `day_of_week`."""
+    """Parse Avazu's YYMMDDHH `hour` column into `hour_of_day` and `day_of_week`.
+
+    Args:
+        df: DataFrame, shape `(n, n_cols)` — must contain `hour_col` with
+            values in `YYMMDDHH` integer/string format.
+        hour_col: Name of the column to parse.
+
+    Returns:
+        DataFrame, shape `(n, n_cols + 2)` — original columns plus
+        `hour_of_day` (int, 0-23) and `day_of_week` (int, 0-6).
+    """
     df = df.copy()
     hour_str = df[hour_col].astype(str)
     hour_of_day = hour_str.str[6:8].astype(int)
@@ -850,6 +1208,19 @@ def fit_freq_agg_stats(
     new raw data without needing the original train_df around. Raw sum/count
     (rather than a precomputed mean) is kept so smoothing strength can be
     chosen at apply time.
+
+    Args:
+        train_df: Training DataFrame, shape `(n_train, n_cols)` — must
+            contain `label_col` and every column in `group_cols`.
+        group_cols: List of column names to compute per-category click
+            sum/count for.
+        label_col: Name of the binary label column.
+
+    Returns:
+        dict mapping each entry of `group_cols` to a DataFrame indexed by
+        that column's distinct training-set values (row count = that
+        column's cardinality, varies per column), with columns `"sum"`/
+        `"count"`.
     """
     return {col: train_df.groupby(col)[label_col].agg(sum="sum", count="count") for col in group_cols}
 
@@ -865,6 +1236,19 @@ def apply_freq_agg_stats(
     in the fit have sum=count=0, which this formula naturally resolves to
     `global_ctr`. Smoothing pulls low-count categories toward the global rate
     instead of trusting a handful of observations outright.
+
+    Args:
+        df: DataFrame to apply stats to, shape `(n, n_cols)` — must contain
+            every key of `fit_stats` as a column.
+        fit_stats: dict as returned by `fit_freq_agg_stats`.
+        global_ctr: Scalar float — the training-set overall click rate,
+            used as the smoothing prior.
+        smoothing: Scalar float — pseudo-observation count controlling how
+            strongly low-count categories are pulled toward `global_ctr`.
+
+    Returns:
+        DataFrame, shape `(n, n_cols + 2 * len(fit_stats))` — original
+        columns plus one `_ctr`/`_count` column pair per key in `fit_stats`.
     """
     df = df.copy()
     for col, stats in fit_stats.items():
@@ -902,6 +1286,20 @@ def add_freq_agg_features(
     Returns `(train_df, val_df, fit_stats)` — `fit_stats` is the explicit
     fit-state from `fit_freq_agg_stats`, suitable for persisting alongside a
     trained model (see `trainer.save_model`).
+
+    Args:
+        train_df: Raw training DataFrame, shape `(n_train, n_cols)`.
+        val_df: Raw validation DataFrame, shape `(n_val, n_cols)`.
+        group_cols: List of column names to target-encode.
+        label_col: Name of the binary label column.
+        smoothing: Scalar float smoothing strength (see
+            `apply_freq_agg_stats`).
+
+    Returns:
+        `(train_df, val_df, fit_stats)` — `train_df`/`val_df` are shape
+        `(n_train, n_cols + 2 * len(group_cols))` /
+        `(n_val, n_cols + 2 * len(group_cols))`; `fit_stats` is the dict
+        from `fit_freq_agg_stats`.
     """
     train_df = train_df.copy()
     val_df = val_df.copy()

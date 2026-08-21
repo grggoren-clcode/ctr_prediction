@@ -49,6 +49,17 @@ RUNS = [
 
 
 def main():
+    """CLI entrypoint: run every `(model, feature_set)` pair in `RUNS` and print a comparison table.
+
+    Args:
+        None as Python parameters — all inputs come from `sys.argv`, parsed
+        by the `argparse.ArgumentParser` below: `--data-path` (path to the
+        raw CSV), `--n-rows` (sample size, scalar int), `--val-frac`
+        (scalar float in `[0, 1]`), `--seed` (scalar int).
+
+    Returns:
+        None (prints the comparison table to stdout).
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=Path, default=RAW_DATA_PATH)
     parser.add_argument("--n-rows", type=int, default=SAMPLE_N_ROWS)
@@ -78,6 +89,19 @@ def main():
     engineered_by_key = {}
 
     def get_engineered(feature_set):
+        """Engineer (and cache by `feature_set_engineering_key`) features for `feature_set`.
+
+        Args:
+            feature_set: One of `RUNS`' feature_set names (str), e.g.
+                `"freq_agg"`/`"baseline_ohe"`.
+
+        Returns:
+            The 4-tuple from `trainer.engineer_features`:
+            `(feat_train_df, feat_val_df, feature_cols, state)` — DataFrames
+            of shape `(len(train_df), n_engineered_cols)` /
+            `(len(val_df), n_engineered_cols)`, `feature_cols` a list of
+            column names, `state` a feature_set-specific fit-state dict.
+        """
         key = feature_set_engineering_key(feature_set)
         if key not in engineered_by_key:
             engineered_by_key[key] = engineer_features(feature_set, train_df, val_df)

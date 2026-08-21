@@ -49,6 +49,21 @@ GROUP_COLS = USER_FEATURE_COLS + AD_FEATURE_COLS
 
 
 def get_model(model_name: str, **kwargs):
+    """Construct an unfitted classifier for `model_name`, applying each model's tuned defaults.
+
+    Args:
+        model_name: Which model to build — one of `"logreg"`, `"hist_gbdt"`,
+            `"lightgbm"`, `"fm"`, `"sgd_logreg"`.
+        **kwargs: Forwarded straight to the underlying estimator's
+            constructor (e.g. `random_state`, or FM-only params like
+            `freq_shrink_alpha`), overriding any conflicting key in that
+            model's tuned defaults dict (`FM_CLASSIFIER_PARAMS`/
+            `SGD_LOGREG_PARAMS`).
+
+    Returns:
+        An unfitted sklearn-compatible classifier instance (exposes
+        `.fit(X, y)`/`.predict_proba(X)`).
+    """
     if model_name == "logreg":
         return LogisticRegression(max_iter=10_000, class_weight="balanced", **kwargs)
     if model_name == "hist_gbdt":
@@ -76,16 +91,49 @@ def get_model(model_name: str, **kwargs):
 
 
 def train_model(model, X_train, y_train):
+    """Fit `model` on `(X_train, y_train)` in place and return it.
+
+    Args:
+        model: Any sklearn-compatible estimator exposing `.fit(X, y)` — a
+            bare classifier from `get_model`, or a `Pipeline` wrapping one.
+        X_train: Training feature matrix, shape `(n_train, d)` — dense
+            `np.ndarray` or sparse `scipy.sparse.csr_matrix` depending on
+            the feature_set's preprocessor.
+        y_train: Training labels, shape `(n_train,)`.
+
+    Returns:
+        The same `model` instance passed in, now fitted (`.fit` mutates it
+        in place; the return value is purely for call-site convenience).
+    """
     model.fit(X_train, y_train)
     return model
 
 
 def save_model(artifact, path: Path) -> None:
+    """Persist `artifact` to `path` via joblib, creating parent directories as needed.
+
+    Args:
+        artifact: Any joblib-picklable object — here always a dict bundling
+            a fitted `Pipeline` plus `feature_set` metadata (see `main`).
+        path: Destination file path.
+
+    Returns:
+        None.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, path)
 
 
 def load_model(path: Path):
+    """Load an artifact previously written by `save_model`.
+
+    Args:
+        path: Path to a joblib file written by `save_model`.
+
+    Returns:
+        The deserialized object (the same dict structure `save_model` was
+        given).
+    """
     return joblib.load(path)
 
 
@@ -93,7 +141,27 @@ def build_features(train_df, val_df, group_cols: list[str] = GROUP_COLS):
     """Engineer features. `add_freq_agg_features` fits aggregates on `train_df`
     only (leave-one-out for train itself, straight application for val) — see
     CLAUDE.md's no-leakage rule. Returns `fit_stats`/`global_ctr` too, so they
-    can be persisted alongside a trained model for scoring new raw data later."""
+    can be persisted alongside a trained model for scoring new raw data later.
+
+    Args:
+        train_df: Raw training split, shape `(n_train, n_raw_cols)` — must
+            contain `LABEL_COL`, `HOUR_COL`, and every column in `group_cols`.
+        val_df: Raw validation split, shape `(n_val, n_raw_cols)`, same
+            schema as `train_df`.
+        group_cols: List of categorical column names (user + ad columns) to
+            target-encode via `add_freq_agg_features`.
+
+    Returns:
+        `(train_df, val_df, cat_cols, num_cols, feature_cols, fit_stats,
+        global_ctr)` — `train_df`/`val_df` are shape
+        `(n_train, n_raw_cols + 2 + 2 * len(group_cols))` /
+        `(n_val, n_raw_cols + 2 + 2 * len(group_cols))`: `+2` for
+        `hour_of_day`/`day_of_week`, `+2 * len(group_cols)` for one `_ctr`/
+        `_count` column pair per entry in `group_cols`; `cat_cols`/
+        `num_cols`/`feature_cols` are lists of column names; `fit_stats` is
+        the dict from `feature_engineering.fit_freq_agg_stats`; `global_ctr`
+        is a scalar float.
+    """
     train_df = add_hour_features(train_df)
     val_df = add_hour_features(val_df)
     global_ctr = train_df[LABEL_COL].mean()
@@ -111,6 +179,17 @@ def build_baseline_ohe_features(train_df, val_df):
     target-encoding, so no fit_stats/global_ctr — the fitted OneHotEncoder
     inside the ColumnTransformer (fit via Pipeline.fit on train_df only) IS
     the fit-state, same as CONTEXT_FEATURE_COLS' OHE already works today.
+
+    Args:
+        train_df: Raw training split, shape `(n_train, n_raw_cols)`.
+        val_df: Raw validation split, shape `(n_val, n_raw_cols)`.
+
+    Returns:
+        `(train_df, val_df, cat_cols, feature_cols)` — `train_df`/`val_df`
+        are shape `(n_train, n_raw_cols + 2)` / `(n_val, n_raw_cols + 2)`
+        after adding `hour_of_day`/`day_of_week`; `cat_cols == feature_cols`,
+        the list of every raw categorical column name to one-hot encode
+        (length `len(ALL_CAT_FEATURE_COLS) + 2`).
     """
     train_df = add_hour_features(train_df)
     val_df = add_hour_features(val_df)
@@ -127,6 +206,17 @@ def build_gbdt_leaf_features(train_df, val_df):
     hand-engineered freq-agg aggregates. See feature_engineering.GBDTLeafEncoder
     for the leaf-extraction + one-hot step that turns the fitted GBDT into
     input features for a downstream linear model.
+
+    Args:
+        train_df: Raw training split, shape `(n_train, n_raw_cols)`.
+        val_df: Raw validation split, shape `(n_val, n_raw_cols)`.
+
+    Returns:
+        `(train_df, val_df, feature_cols)` — `train_df`/`val_df` are shape
+        `(n_train, n_raw_cols + 2)` / `(n_val, n_raw_cols + 2)` after adding
+        `hour_of_day`/`day_of_week` and casting `ALL_CAT_FEATURE_COLS` to
+        'category' dtype (vocabulary fixed from `train_df`); `feature_cols`
+        is a list of column names, length `len(ALL_CAT_FEATURE_COLS) + 2`.
     """
     train_df = add_hour_features(train_df)
     val_df = add_hour_features(val_df)
@@ -164,6 +254,16 @@ FEATURE_SET_COMPATIBLE_MODELS = {
 
 
 def check_feature_set_model_compatible(feature_set: str, model_name: str) -> None:
+    """Raise if `model_name` isn't a supported pairing for `feature_set`.
+
+    Args:
+        feature_set: One of `FEATURE_SET_COMPATIBLE_MODELS`' keys (str).
+        model_name: One of the `--model` choices (str) to check.
+
+    Returns:
+        None. Raises `ValueError` (and `KeyError` if `feature_set` is
+        unknown) rather than returning a boolean.
+    """
     compatible = FEATURE_SET_COMPATIBLE_MODELS[feature_set]
     if model_name not in compatible:
         raise ValueError(
@@ -181,6 +281,13 @@ def feature_set_engineering_key(feature_set: str) -> str:
     that engineer features for multiple feature_sets (e.g. run_pipeline.py)
     can cache by this key instead of by feature_set to avoid redundant work.
     Co-located with `engineer_features` so the two can't drift out of sync.
+
+    Args:
+        feature_set: One of the `--feature-set` choices (str).
+
+    Returns:
+        str cache key — either `"baseline_ohe_family"`, `"freq_agg_family"`,
+        or `feature_set` itself unchanged.
     """
     if feature_set in ("baseline_ohe", "gbdt_leaves_ohe", "gbdt_leaves_concat"):
         return "baseline_ohe_family"
@@ -197,6 +304,21 @@ def engineer_features(feature_set: str, train_df, val_df):
     Split out from `build_preprocessor` so callers that train multiple models
     on the same feature_set (e.g. run_pipeline.py) can engineer features once
     and build a fresh preprocessor per model.
+
+    Args:
+        feature_set: Which feature engineering path to run (str, one of the
+            `--feature-set` choices).
+        train_df: Raw training split, shape `(n_train, n_raw_cols)`.
+        val_df: Raw validation split, shape `(n_val, n_raw_cols)`.
+
+    Returns:
+        `(train_df, val_df, feature_cols, state)` — engineered DataFrames
+        (row count unchanged from the inputs; column count extended
+        per-feature_set, see the `build_*_features` helper each branch
+        calls); `feature_cols` is the list of column names the preprocessor/
+        model should consume; `state` is a feature_set-specific dict of
+        fit-state (fitted-encoder inputs, aggregate stats, etc.) consumed by
+        `build_preprocessor`.
     """
     if feature_set in ("freq_agg", "freq_agg_leaves_concat", "freq_agg_fm_concat"):
         train_df, val_df, freq_cat_cols, freq_num_cols, freq_feature_cols, fit_stats, global_ctr = build_features(
@@ -253,6 +375,24 @@ def build_preprocessor(feature_set: str, state: dict, seed: int):
     than reusing one across calls, so training multiple models on the same
     engineered DataFrames (e.g. run_pipeline.py) doesn't have them share a
     preprocessor object mutated by a prior model's `Pipeline.fit`.
+
+    Args:
+        feature_set: Which feature_set's preprocessing pipeline to build
+            (str, one of the `--feature-set` choices).
+        state: The state dict returned by `engineer_features` for the same
+            `feature_set`.
+        seed: Random seed (scalar int) forwarded to any preprocessing step
+            with its own randomness — currently only the internal GBDT in
+            the `gbdt_leaves*`/`freq_agg_leaves_concat` branches.
+
+    Returns:
+        An unfitted sklearn-compatible transformer (`ColumnTransformer`/
+        `Pipeline`/`FeatureUnion`/`GBDTLeafEncoder`) — once fit+transformed
+        on a DataFrame of `feature_cols` columns, shape `(n_rows,
+        n_feature_cols)`, it produces a 2D feature matrix of shape
+        `(n_rows, d)` where `d` depends on `feature_set` (dense `np.ndarray`
+        or sparse `csr_matrix`; see each `build_*_pipeline` docstring in
+        `feature_engineering.py` for its exact `d`).
     """
     if feature_set == "freq_agg":
         return build_preprocessing_pipeline(state["cat_cols"], state["num_cols"])
@@ -286,6 +426,22 @@ def build_preprocessor(feature_set: str, state: dict, seed: int):
 
 
 def main():
+    """CLI entrypoint: train one `(--model, --feature-set)` pair and persist metrics + the fitted pipeline.
+
+    Args:
+        None as Python parameters — all inputs come from `sys.argv`, parsed
+        by the `argparse.ArgumentParser` below: `--data-path`, `--n-rows`
+        (scalar int), `--model`, `--feature-set`, `--val-frac` (scalar float
+        in `[0, 1]`), `--output-dir`, `--seed` (scalar int),
+        `--freq-shrink-alpha`/`--freq-shrink-m` (scalar floats, `fm`/
+        `sgd_logreg` only), `--hierarchy-beta`/`--hierarchy-m` (scalar
+        floats, `fm` + `baseline_ohe` only).
+
+    Returns:
+        The `metrics` dict from `evaluator.evaluate` (also printed and
+        written to `{output_dir}/metrics_{stem}.json`); the fitted pipeline
+        is additionally saved to `{MODELS_DIR}/{stem}.joblib`.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=Path, default=RAW_DATA_PATH)
     parser.add_argument("--n-rows", type=int, default=SAMPLE_N_ROWS)
