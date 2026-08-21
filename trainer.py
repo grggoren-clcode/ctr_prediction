@@ -42,6 +42,7 @@ from feature_engineering import (
     build_hierarchy_parent_map,
     build_ohe_only_pipeline,
     build_preprocessing_pipeline,
+    internal_train_idx,
     to_lgbm_categoricals,
 )
 
@@ -507,35 +508,57 @@ def main():
     if args.model in ("fm", "sgd_logreg"):
         model_kwargs["freq_shrink_alpha"] = args.freq_shrink_alpha
         model_kwargs["freq_shrink_m"] = args.freq_shrink_m
+    if hierarchy_enabled:
+        model_kwargs["hierarchy_beta"] = args.hierarchy_beta
+        model_kwargs["hierarchy_m"] = args.hierarchy_m
+    model = get_model(args.model, **model_kwargs)
+
+    # Fit the preprocessor and model as two explicit steps — rather than a
+    # single pipeline.fit() call — for every feature_set/model, not only the
+    # hierarchy-enabled ones: this is the one seam every path needs between
+    # "preprocess" and "model" finishing (previously only the hierarchy
+    # branch unrolled this, duplicating the whole fit/predict flow in a
+    # second, easy-to-drift-from branch; see git history). Equivalent to
+    # Pipeline.fit(X, y): for a 2-step pipeline, Pipeline._fit calls exactly
+    # preprocessor.fit_transform(X, y) then model.fit(Xt, y) internally, so
+    # doing it explicitly here changes nothing about what gets fit — y is
+    # threaded through fit_transform since GBDTLeafEncoder/
+    # FMEmbeddingEncoder-based preprocessors (gbdt_leaves*/
+    # freq_agg_*_concat) need it, even though ColumnTransformer-based ones
+    # ignore it.
+    X_train = preprocessor.fit_transform(train_df[feature_cols], train_df[LABEL_COL])
 
     if hierarchy_enabled:
         # Hierarchical back-off needs the fitted OneHotEncoder's categories_
-        # to build the child->parent column-index map, which a single
-        # Pipeline.fit() call never exposes a seam for between the
-        # "preprocess" and "model" steps — so unroll them manually here.
-        # Every other case (the vast majority of runs) keeps the original
-        # single-pipeline.fit() path in the else branch below untouched.
-        # Pipeline([...]) is reassembled from the already-fitted steps
-        # afterward purely for save_model's artifact bundling below —
-        # Pipeline.predict_proba/.transform only delegate to each step's own
-        # fitted state, with no bookkeeping tied to whether .fit() was
-        # called on the Pipeline object itself, so this is safe.
-        X_train = preprocessor.fit_transform(train_df[feature_cols])
+        # to build the child->parent column-index map — available now that
+        # fit_transform has run above. Scope the map to exactly the rows
+        # _fit_fm_sgd's own col_counts will see (its internal
+        # val_frac-sized held-out slice excluded) via
+        # feature_engineering.internal_train_idx — the same chronological-
+        # prefix helper _fit_fm_sgd uses internally — so the per-child
+        # mode-parent vote and the rarity weighting that uses it are always
+        # computed over the same rows, rather than the map being fit on
+        # rows col_counts never sees. Set directly on the already-
+        # constructed model (equivalent to passing it as a constructor
+        # kwarg — sklearn params are plain attributes, and .fit() only
+        # reads this one at fit time) since knowing where to slice train_df
+        # requires model.val_frac, which requires the model to already
+        # exist.
         ohe = preprocessor.named_transformers_["cat"]
-        parent_idx = build_hierarchy_parent_map(train_df, state["cat_cols"], ohe, AD_HIERARCHY_PAIRS)
-        model_kwargs["hierarchy_parent_idx"] = parent_idx
-        model_kwargs["hierarchy_beta"] = args.hierarchy_beta
-        model_kwargs["hierarchy_m"] = args.hierarchy_m
-        model = get_model(args.model, **model_kwargs)
-        train_model(model, X_train, train_df[LABEL_COL])
-        X_val = preprocessor.transform(val_df[feature_cols])
-        val_pred_proba = model.predict_proba(X_val)[:, 1]
-        pipeline = Pipeline([("preprocess", preprocessor), ("model", model)])
-    else:
-        model = get_model(args.model, **model_kwargs)
-        pipeline = Pipeline([("preprocess", preprocessor), ("model", model)])
-        train_model(pipeline, train_df[feature_cols], train_df[LABEL_COL])
-        val_pred_proba = pipeline.predict_proba(val_df[feature_cols])[:, 1]
+        hier_train_idx = internal_train_idx(len(train_df), model.val_frac)
+        model.hierarchy_parent_idx = build_hierarchy_parent_map(
+            train_df.iloc[hier_train_idx], state["cat_cols"], ohe, AD_HIERARCHY_PAIRS
+        )
+
+    train_model(model, X_train, train_df[LABEL_COL])
+    X_val = preprocessor.transform(val_df[feature_cols])
+    val_pred_proba = model.predict_proba(X_val)[:, 1]
+    # Reassembled from already-fitted steps (not pipeline.fit()) purely for
+    # save_model's artifact bundling below — Pipeline.predict_proba/
+    # .transform only delegate to each step's own fitted state, with no
+    # bookkeeping tied to whether .fit() was called on the Pipeline object
+    # itself, so this is safe.
+    pipeline = Pipeline([("preprocess", preprocessor), ("model", model)])
 
     metrics = evaluate(val_df[LABEL_COL], val_pred_proba)
     print_metrics(metrics)

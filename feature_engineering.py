@@ -298,6 +298,29 @@ DEFAULT_FREQ_SHRINK_M = 20.0
 DEFAULT_HIERARCHY_M = 20.0
 
 
+def _pseudo_count_weight(count: np.ndarray, m: float) -> np.ndarray:
+    """Shared pseudo-count smoothing weight `m / (count + m)`, decaying from
+    ~1 at `count=0` to ~0 as `count -> infinity` — the same underlying
+    weighting form both `_fit_fm_sgd`'s Technique A (frequency-adaptive
+    shrinkage) and Technique B (hierarchical back-off) use to scale their
+    regularization strength by column rarity (previously duplicated
+    inline in both places). Also the weight implicit in
+    `apply_freq_agg_stats`' `(S + m*p̄)/(N+m)` smoothing formula — that
+    function is left computing its combined numerator/denominator directly
+    rather than calling this helper, since rewriting it via an explicit
+    `rho` would introduce a `0/0` risk at `count=0` that its current form
+    avoids by construction.
+
+    Args:
+        count: Per-column counts, shape `(n_active,)`.
+        m: Scalar float pseudo-count smoothing constant, must be `> 0`.
+
+    Returns:
+        `np.ndarray` of shape `(n_active,)`, values in `(0, 1]`.
+    """
+    return m / (count + m)
+
+
 def build_hierarchy_parent_map(
     train_df: pd.DataFrame,
     cat_cols: list[str],
@@ -343,6 +366,21 @@ def build_hierarchy_parent_map(
         `i`'s parent, or `-1` if column `i` has no parent (not part of any
         pair, or its mode-parent value couldn't be resolved).
     """
+    # The offset walk below assumes cat_cols is in the exact order `ohe` was
+    # fit on (per the docstring's ordering contract) — enforce it rather
+    # than trust it silently, wherever sklearn gives us a way to check:
+    # fitting a OneHotEncoder on a DataFrame records the input column order
+    # as `feature_names_in_` (sklearn >=1.0). If that attribute is present
+    # and disagrees with cat_cols, every offset (and therefore every parent
+    # index) computed below would be silently wrong — fail loudly instead.
+    feature_names_in = getattr(ohe, "feature_names_in_", None)
+    if feature_names_in is not None and list(feature_names_in) != list(cat_cols):
+        raise ValueError(
+            f"cat_cols order {list(cat_cols)} does not match the order ohe was fit on "
+            f"{list(feature_names_in)} — build_hierarchy_parent_map's offset walk requires "
+            "these to match exactly."
+        )
+
     offsets: dict[str, tuple[int, dict]] = {}
     offset = 0
     for col, categories in zip(cat_cols, ohe.categories_, strict=True):
@@ -356,15 +394,19 @@ def build_hierarchy_parent_map(
             continue
         _child_offset, child_value_to_idx = offsets[child_col]
         _parent_offset, parent_value_to_idx = offsets[parent_col]
-        # value_counts() drops NaN by default, so a child value whose every
-        # co-occurring parent value is NaN yields an empty Series here —
-        # idxmax() would raise on that rather than the "no reliable parent,
-        # leave as -1" behavior the rest of this function already gives
-        # unseen/unmapped values, so guard it explicitly instead of assuming
-        # every group has at least one non-null parent value.
-        mode_parent = train_df.groupby(child_col)[parent_col].agg(
-            lambda s: s.value_counts().idxmax() if not s.value_counts().empty else None
-        )
+
+        def _mode_or_none(s: pd.Series):
+            # value_counts() drops NaN by default, so a child value whose
+            # every co-occurring parent value is NaN yields an empty Series
+            # here — idxmax() would raise on that rather than the "no
+            # reliable parent, leave as -1" behavior the rest of this
+            # function already gives unseen/unmapped values, so guard it
+            # explicitly instead of assuming every group has at least one
+            # non-null parent value. Computed once (not twice) per group.
+            counts = s.value_counts()
+            return counts.idxmax() if not counts.empty else None
+
+        mode_parent = train_df.groupby(child_col)[parent_col].agg(_mode_or_none)
         for child_val, parent_val in mode_parent.items():
             if parent_val is None or child_val not in child_value_to_idx or parent_val not in parent_value_to_idx:
                 continue
@@ -446,6 +488,31 @@ def _fm_eval_loss(
     """
     z, _s = _fm_forward(X, w0, w, v)
     return _weighted_bce_loss(y, expit(z), sample_weight)
+
+
+def internal_train_idx(n: int, val_frac: float) -> np.ndarray:
+    """The row-index prefix `_fit_fm_sgd` treats as its internal training
+    portion for a given `n`/`val_frac`, mirroring its own chronological
+    split exactly (see `_fit_fm_sgd`'s docstring for why this must be a
+    prefix, not a random subset) — exposed as a public helper so callers
+    that need to fit something on exactly the same rows `_fit_fm_sgd` will
+    train on (e.g. `trainer.py` building `hierarchy_parent_idx` before
+    calling `.fit()`, so its per-child mode-parent vote is scored on the
+    same rows `col_counts`' rarity weighting sees) can replicate the split
+    without duplicating — and risking drifting from — this arithmetic.
+
+    Args:
+        n: Scalar int — total row count of the array `_fit_fm_sgd` will be
+            called with.
+        val_frac: Scalar float in `[0, 1]` — same meaning as `_fit_fm_sgd`'s
+            `val_frac` parameter.
+
+    Returns:
+        1D `np.ndarray` of shape `(n - int(n * val_frac),)` (or `(n,)` if
+        `val_frac <= 0`) — `np.arange(0, n - n_val)`.
+    """
+    n_val = int(n * val_frac) if val_frac > 0 else 0
+    return np.arange(0, n - n_val)
 
 
 def _fit_fm_sgd(
@@ -592,7 +659,19 @@ def _fit_fm_sgd(
             "_fit_fm_sgd requires binary (0/1) one-hot input — the x_i^2 = x_i identity "
             "the interaction term and its gradient rely on does not hold otherwise."
         )
+    # Enabling a technique (alpha/beta > 0) without the state/smoothing it
+    # needs must fail loudly rather than silently no-op or divide by zero —
+    # mirrors the existing n_factors==0 check below, which raises for the
+    # same reason instead of quietly training a plain FM.
+    if freq_shrink_alpha > 0 and freq_shrink_m <= 0:
+        raise ValueError(f"freq_shrink_m must be > 0 when freq_shrink_alpha > 0, got {freq_shrink_m}")
+    if hierarchy_beta > 0 and hierarchy_parent_idx is None:
+        raise ValueError("hierarchy_beta > 0 requires hierarchy_parent_idx to be given (not None)")
+    if hierarchy_beta > 0 and hierarchy_m <= 0:
+        raise ValueError(f"hierarchy_m must be > 0 when hierarchy_beta > 0, got {hierarchy_m}")
     if hierarchy_parent_idx is not None:
+        if not np.issubdtype(hierarchy_parent_idx.dtype, np.integer):
+            raise ValueError(f"hierarchy_parent_idx must have an integer dtype, got {hierarchy_parent_idx.dtype}")
         if hierarchy_parent_idx.shape != (d,):
             raise ValueError(f"hierarchy_parent_idx must have shape ({d},), got {hierarchy_parent_idx.shape}")
         valid = hierarchy_parent_idx == -1
@@ -610,13 +689,17 @@ def _fit_fm_sgd(
 
     # Chronological split (last val_frac fraction of rows, by position) —
     # see the docstring above for why this must not be a random split.
-    n_val = int(n * val_frac) if val_frac > 0 else 0
-    val_idx = np.arange(n - n_val, n)
-    train_idx = np.arange(0, n - n_val)
+    # internal_train_idx is exposed so callers that need to fit something on
+    # exactly the same rows (e.g. trainer.py building hierarchy_parent_idx
+    # before calling .fit()) can replicate this split without duplicating
+    # the arithmetic.
+    train_idx = internal_train_idx(n, val_frac)
+    n_train = len(train_idx)
+    n_val = n - n_train
+    val_idx = np.arange(n_train, n)
     use_val = n_val > 0 and sample_weight[val_idx].sum() > 0
     if use_val:
         X_val, y_val, sw_val = X[val_idx], y[val_idx], sample_weight[val_idx]
-    n_train = len(train_idx)
     if n_train == 0:
         raise ValueError(f"val_frac={val_frac} leaves no rows to train on (n_train=0) — reduce val_frac.")
 
@@ -624,10 +707,13 @@ def _fit_fm_sgd(
     # (frequency-adaptive shrinkage) and Technique B (hierarchical back-off)
     # — computed once here, not per-batch. X is binary 0/1, so a column sum
     # over rows is exactly that column's training activation count. Only
-    # computed from train_idx (never val_idx), matching the rest of this
-    # function's train-only fit-state discipline.
+    # computed from the train_idx prefix (never val_idx), matching the rest
+    # of this function's train-only fit-state discipline. X[:n_train]
+    # (a contiguous slice) rather than X[train_idx] (fancy indexing that
+    # would force a full copy) — train_idx is always the prefix
+    # np.arange(0, n_train) by construction, so the two are equivalent.
     need_col_counts = freq_shrink_alpha > 0 or (hierarchy_parent_idx is not None and hierarchy_beta > 0)
-    col_counts = np.asarray(X[train_idx].sum(axis=0)).ravel() if need_col_counts else None
+    col_counts = np.asarray(X[:n_train].sum(axis=0)).ravel() if need_col_counts else None
 
     w0 = 0.0
     w_ = np.zeros(d, dtype=np.float64)
@@ -673,6 +759,15 @@ def _fit_fm_sgd(
             # via the same x_i^2=x_i trick used inside _fm_forward.
             grad_v_active = (Xb_active.T @ (err[:, None] * s)) / denom - v_active * (g_active / denom)[:, None]
 
+            # NOTE for anyone extending l2_eff_w/l2_eff_v/grad_hier_active
+            # below: each is deliberately EITHER a bare Python float (the
+            # disabled-by-default path, zero extra allocation) OR an
+            # (n_active,)/(n_active, 1)/(n_active, k) ndarray (the enabled
+            # path) — never assume one or the other. numpy broadcasting
+            # makes both cases work in the final update line unmodified, but
+            # any new code touching these three variables directly (e.g.
+            # indexing into them) must handle both types.
+
             # Technique A: frequency-adaptive shrinkage — per-column L2
             # strength scaled up for rarely-seen columns (rho -> 1 as
             # col_counts -> 0), mirroring apply_freq_agg_stats' additive-
@@ -688,7 +783,7 @@ def _fit_fm_sgd(
             l2_eff_w = l2_reg
             l2_eff_v = l2_reg
             if col_counts is not None and freq_shrink_alpha > 0:
-                rho_shrink = freq_shrink_m / (col_counts[active_cols] + freq_shrink_m)
+                rho_shrink = _pseudo_count_weight(col_counts[active_cols], freq_shrink_m)
                 l2_eff_w = l2_reg * (1.0 + freq_shrink_alpha * rho_shrink)
                 l2_eff_v = l2_eff_w[:, None]
 
@@ -709,7 +804,7 @@ def _fit_fm_sgd(
                 has_parent = parent_active != -1
                 if has_parent.any():
                     grad_hier_active = np.zeros_like(v_active)
-                    rho_hier = hierarchy_m / (col_counts[active_cols][has_parent] + hierarchy_m)
+                    rho_hier = _pseudo_count_weight(col_counts[active_cols][has_parent], hierarchy_m)
                     grad_hier_active[has_parent] = hierarchy_beta * rho_hier[:, None] * (
                         v_active[has_parent] - v_[parent_active[has_parent]]
                     )
