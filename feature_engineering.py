@@ -1037,11 +1037,18 @@ class FMClassifier(BaseEstimator, ClassifierMixin):
     `z = w0 + Xw + interaction` directly as `predict_proba`, so there is no
     second, independently-trained linear model layered on top.
 
-    Only usable with pure one-hot input (e.g. the `baseline_ohe` feature
-    set): the `x_i^2 = x_i` identity the training/prediction math relies on
-    does not hold for continuous features like `freq_agg`'s `_ctr`/`_count`
-    columns — see `trainer.FEATURE_SET_COMPATIBLE_MODELS`, which restricts
-    `"fm"` to `"baseline_ohe"` only, for this reason.
+    Only usable with pure one-hot input (e.g. the `baseline_ohe` or
+    `gbdt_leaves_concat` feature sets): the `x_i^2 = x_i` identity the
+    training/prediction math relies on does not hold for continuous
+    features like `freq_agg`'s `_ctr`/`_count` columns — see
+    `trainer.FEATURE_SET_COMPATIBLE_MODELS`, which restricts `"fm"` to
+    feature_sets whose entire output is pure one-hot, for this reason.
+    `gbdt_leaves_concat` in particular trains `"fm"` on the concatenation
+    of raw one-hot and GBDT-leaf one-hot as a single input, so both
+    regions get their own pairwise latent vectors and interact through
+    the same FM term — not GBDT leaves as induced features for a
+    separately-trained model (see `FM_GBDT_LEAVES_CONCAT_PARAMS` in
+    `consts.py`).
 
     `class_weight` mirrors `sklearn.linear_model.LogisticRegression`'s
     parameter of the same name (`trainer.get_model` passes

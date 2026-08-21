@@ -1,11 +1,14 @@
 """One-command end-to-end run: load -> time-split -> engineer features -> train -> evaluate.
 
 Trains `logreg`/`hist_gbdt` on the `freq_agg` feature set, `logreg`/`fm`/`sgd_logreg`
-on the naive `baseline_ohe` feature set, and `logreg` on the GBDT-leaf-embedding
+on the naive `baseline_ohe` feature set, `logreg` on the GBDT-leaf-embedding
 `gbdt_leaves`/`gbdt_leaves_ohe`/`gbdt_leaves_concat`/`freq_agg_leaves_concat`
-and FM-embedding `freq_agg_fm_concat` feature sets (see trainer.py), all on
-the same sample/split, and prints a comparison table. This is the scaffold's
-smoke test against the real data.
+feature sets, `fm` again on `gbdt_leaves_concat` (a single jointly-optimized
+FM whose pairwise term covers raw-category x GBDT-leaf interactions, not
+just a downstream linear model over both), and `logreg` on the FM-embedding
+`freq_agg_fm_concat` feature set (see trainer.py), all on the same
+sample/split, and prints a comparison table. This is the scaffold's smoke
+test against the real data.
 """
 
 import argparse
@@ -17,6 +20,7 @@ from consts import LABEL_COL, RANDOM_SEED, RAW_DATA_PATH, SAMPLE_N_ROWS, VAL_FRA
 from data_loader import load_sample, time_based_split, validate_schema
 from evaluator import evaluate
 from trainer import (
+    build_model_kwargs,
     build_preprocessor,
     check_feature_set_model_compatible,
     engineer_features,
@@ -32,7 +36,8 @@ from trainer import (
 # see FEATURE_SET_COMPATIBLE_MODELS there for exactly which feature_sets are
 # dense vs. sparse; freq_agg_fm_concat, despite its GBDT-leaf-shaped
 # structure, actually is fully dense). "fm"/"sgd_logreg" (both FMClassifier)
-# are likewise only paired with baseline_ohe: their training/prediction math
+# are restricted to feature_sets whose entire output is pure one-hot (0/1):
+# baseline_ohe and gbdt_leaves_concat — their training/prediction math
 # relies on x_i^2 = x_i, which only holds for pure one-hot columns.
 RUNS = [
     ("logreg", "freq_agg"),
@@ -43,6 +48,7 @@ RUNS = [
     ("logreg", "gbdt_leaves"),
     ("logreg", "gbdt_leaves_ohe"),
     ("logreg", "gbdt_leaves_concat"),
+    ("fm", "gbdt_leaves_concat"),
     ("logreg", "freq_agg_leaves_concat"),
     ("logreg", "freq_agg_fm_concat"),
 ]
@@ -111,7 +117,8 @@ def main():
     for model_name, feature_set in RUNS:
         feat_train_df, feat_val_df, feature_cols, state = get_engineered(feature_set)
         preprocessor = build_preprocessor(feature_set, state, args.seed)
-        pipeline = Pipeline([("preprocess", preprocessor), ("model", get_model(model_name, random_state=args.seed))])
+        model = get_model(model_name, **build_model_kwargs(model_name, feature_set, args.seed))
+        pipeline = Pipeline([("preprocess", preprocessor), ("model", model)])
         train_model(pipeline, feat_train_df[feature_cols], feat_train_df[LABEL_COL])
         val_pred_proba = pipeline.predict_proba(feat_val_df[feature_cols])[:, 1]
         results[f"{model_name}/{feature_set}"] = evaluate(feat_val_df[LABEL_COL], val_pred_proba)

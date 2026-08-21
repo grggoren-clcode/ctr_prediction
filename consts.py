@@ -147,3 +147,39 @@ SGD_LOGREG_PARAMS = {
     "learning_rate": 0.2,
     "l2_reg": 1e-5,
 }
+
+# Defaults for feature_engineering.FMClassifier used as --model fm paired
+# specifically with --feature-set gbdt_leaves_concat (see
+# trainer.build_model_kwargs) — a single jointly-optimized FM trained on the
+# concatenation of raw one-hot + GBDT-leaf one-hot (both regions fully in
+# FM's pairwise term, not induced features for a downstream linear model).
+#
+# NOT the same tuning as FM_CLASSIFIER_PARAMS (tuned for baseline_ohe): a
+# row activates roughly 5x more one-hot columns here (~123 active
+# columns/row vs baseline_ohe's ~23), since GBDT leaves add one active
+# column per tree (100 trees per GBDT_LEAF_ENCODER_PARAMS) on top of the
+# usual raw-category columns. FM_CLASSIFIER_PARAMS' learning_rate=0.4 /
+# batch_size=512 reliably breaks this denser input — confirmed directly:
+# training either raises FloatingPointError (non-finite loss) or
+# degenerates to a constant ~30 logloss / AUC=0.5 prediction within 1-2
+# epochs, at both learning_rate=0.4 and 0.2, regardless of batch_size
+# (512/2048/4096 all tried).
+#
+# A staged sweep on a 100K-row sample (same methodology as
+# FM_CLASSIFIER_PARAMS/SGD_LOGREG_PARAMS: vary each axis from a baseline,
+# then combine the best per-axis values and search their neighborhood)
+# found learning_rate<=0.1 the dividing line between stable and diverging
+# (as above), n_factors=32 modestly ahead of 8/16 (64 was worse — likely
+# too many parameters for this sample size/optimizer to fit well), and
+# batch_size=256 slightly ahead of 512/1024/2048. l2_reg had ~no effect
+# across the range tested (matching FM_CLASSIFIER_PARAMS' own finding).
+# Confirmed stable across 3 random seeds on the 100K-row sample and at
+# full 2M-row scale: AUC 0.7450/LogLoss 0.5878 — a slight edge over
+# fm/baseline_ohe's AUC 0.7444/LogLoss 0.6040 on both metrics.
+FM_GBDT_LEAVES_CONCAT_PARAMS = {
+    "n_factors": 32,
+    "n_epochs": 60,
+    "batch_size": 256,
+    "learning_rate": 0.08,
+    "l2_reg": 1e-5,
+}

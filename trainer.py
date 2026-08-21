@@ -14,6 +14,7 @@ from consts import (
     CONTEXT_FEATURE_COLS,
     FM_CLASSIFIER_PARAMS,
     FM_ENCODER_PARAMS,
+    FM_GBDT_LEAVES_CONCAT_PARAMS,
     GBDT_LEAF_ENCODER_PARAMS,
     HOUR_DERIVED_COLS,
     LABEL_COL,
@@ -89,6 +90,46 @@ def get_model(model_name: str, **kwargs):
         # collide with **SGD_LOGREG_PARAMS below.
         return FMClassifier(n_factors=0, class_weight="balanced", **{**SGD_LOGREG_PARAMS, **kwargs})
     raise ValueError(f"Unknown model_name: {model_name!r}")
+
+
+def build_model_kwargs(model_name: str, feature_set: str, seed: int) -> dict:
+    """Assemble the base kwargs dict for `get_model(model_name, **kwargs)`,
+    applying any `(model_name, feature_set)`-specific hyperparameter
+    override needed for stability/performance — currently just
+    `("fm", "gbdt_leaves_concat")` (see `FM_GBDT_LEAVES_CONCAT_PARAMS`'
+    docstring in `consts.py` for why `FM_CLASSIFIER_PARAMS`' baseline_ohe-
+    tuned learning_rate/batch_size diverge on this wider, denser-per-row
+    feature_set). Centralized here rather than duplicated in both `main()`
+    and `run_pipeline.py` (which each construct a model per `(model,
+    feature_set)` pair) — the same "two branches can silently drift" risk
+    already fixed once for the hierarchical back-off path.
+
+    `("sgd_logreg", "gbdt_leaves_concat")` deliberately gets no override,
+    despite being the same wider/denser feature_set that broke `fm`'s
+    baseline_ohe-tuned hyperparameters: `sgd_logreg` has no pairwise
+    interaction term (n_factors=0), and the instability that motivated
+    `FM_GBDT_LEAVES_CONCAT_PARAMS` is specifically the pairwise term
+    amplifying per-batch gradient noise (see `FM_CLASSIFIER_PARAMS`'
+    docstring on `fm`'s batch_size being larger than `sgd_logreg`'s for the
+    same reason) — confirmed directly, not just inferred: `SGD_LOGREG_PARAMS`
+    (learning_rate=0.2, batch_size=128) trained without divergence across 5
+    random seeds on a 100K-row `gbdt_leaves_concat` sample and at full
+    2M-row scale (AUC 0.7407/LogLoss 0.4639).
+
+    Args:
+        model_name: One of the `--model` choices (str).
+        feature_set: One of the `--feature-set` choices (str).
+        seed: Scalar int random seed, always included as `random_state`.
+
+    Returns:
+        dict of kwargs, ready to pass to `get_model(model_name, **kwargs)`
+        (or to merge further CLI-driven overrides into, as `main()` does
+        for `--freq-shrink-alpha`/`--hierarchy-beta`).
+    """
+    model_kwargs = {"random_state": seed}
+    if model_name == "fm" and feature_set == "gbdt_leaves_concat":
+        model_kwargs.update(FM_GBDT_LEAVES_CONCAT_PARAMS)
+    return model_kwargs
 
 
 def train_model(model, X_train, y_train):
@@ -240,15 +281,22 @@ def build_gbdt_leaf_features(train_df, val_df):
 # sparse one-hot leaves.
 FEATURE_SET_COMPATIBLE_MODELS = {
     "freq_agg": {"logreg", "hist_gbdt", "lightgbm"},
-    # "fm"/"sgd_logreg" (both FMClassifier) are restricted to baseline_ohe
-    # specifically — their training/prediction math relies on x_i^2 = x_i,
-    # which only holds for pure one-hot columns, not e.g. freq_agg's
-    # continuous _ctr/_count columns or the concatenated/leaf-derived
-    # feature sets below.
+    # "fm"/"sgd_logreg" (both FMClassifier) are restricted to feature_sets
+    # whose entire output is pure one-hot (0/1) columns — their training/
+    # prediction math relies on x_i^2 = x_i, which does not hold for e.g.
+    # freq_agg's continuous _ctr/_count columns. baseline_ohe and
+    # gbdt_leaves_concat both qualify: gbdt_leaves_concat's raw-one-hot AND
+    # GBDT-leaf-one-hot branches are each themselves pure 0/1, so their
+    # FeatureUnion concatenation is too — meaning "fm" here trains a single
+    # jointly-optimized FM whose pairwise term covers interactions between
+    # raw categories AND GBDT leaves, not just within each group separately
+    # (see build_gbdt_leaves_concat_pipeline). gbdt_leaves_ohe (leaf-only,
+    # no raw one-hot) would also technically qualify but isn't included
+    # here — no baseline currently asks for FM over leaves alone.
     "baseline_ohe": {"logreg", "lightgbm", "fm", "sgd_logreg"},
     "gbdt_leaves": {"logreg", "lightgbm"},
     "gbdt_leaves_ohe": {"logreg", "lightgbm"},
-    "gbdt_leaves_concat": {"logreg", "lightgbm"},
+    "gbdt_leaves_concat": {"logreg", "lightgbm", "fm", "sgd_logreg"},
     "freq_agg_leaves_concat": {"logreg", "lightgbm"},
     "freq_agg_fm_concat": {"logreg", "hist_gbdt", "lightgbm"},
 }
@@ -504,7 +552,7 @@ def main():
     train_df, val_df, feature_cols, state = engineer_features(args.feature_set, train_df, val_df)
     preprocessor = build_preprocessor(args.feature_set, state, args.seed)
 
-    model_kwargs = {"random_state": args.seed}
+    model_kwargs = build_model_kwargs(args.model, args.feature_set, args.seed)
     if args.model in ("fm", "sgd_logreg"):
         model_kwargs["freq_shrink_alpha"] = args.freq_shrink_alpha
         model_kwargs["freq_shrink_m"] = args.freq_shrink_m

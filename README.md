@@ -125,7 +125,17 @@ fraction of the sample), `--data-path` (override the raw data location).
   original linear signal and the GBDT's induced non-linear signal — this
   matches the Facebook paper's actual design (leaves *augment* the base
   features rather than replacing them), unlike the leaf-only
-  `gbdt_leaves_ohe`. Also intended for `--model logreg`.
+  `gbdt_leaves_ohe`. Intended for `--model logreg`, `--model fm`, or
+  `--model sgd_logreg` — both branches are pure 0/1 one-hot, so the
+  concatenation still satisfies `FMClassifier`'s `x_i^2 = x_i` requirement.
+  `--model fm` here is a different design from `freq_agg_fm_concat`/
+  `gbdt_leaves_concat` + `logreg`: instead of a GBDT/FM inducing features
+  for a *separately*-trained downstream linear model, the raw one-hot
+  columns and the GBDT-leaf columns are trained *together* as a single
+  jointly-optimized FM, so the leaf indicators get their own pairwise
+  latent vectors and participate in FM's interaction term — including
+  interactions between GBDT leaves and raw categories, not just within
+  each group separately.
 - **`--feature-set freq_agg_leaves_concat`**: concatenates `freq_agg`'s
   engineered features (capped context one-hot + smoothed target-encoded
   user/ad aggregates + hour) with GBDT-leaf one-hot features from the same
